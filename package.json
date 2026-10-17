@@ -13,9 +13,13 @@
     "tandem",
     "parallel"
   ],
+  "scripts": {
+    "test": "node test/completion-marker.mjs"
+  },
   "files": [
     "index.js",
     "lib",
+    "test",
     "cordis.patch.yml",
     "README.md",
     "config.example.json"
