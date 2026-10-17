@@ -16,7 +16,7 @@ import { existsSync, readFileSync, appendFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { validateTasks, normalizeRoots, runTasks, summarize } from './lib/delegate.js';
-import { runConsult, MODES } from './lib/consult.js';
+import { runConsult, readLastConsult, MODES } from './lib/consult.js';
 import { ensureEnv, credentialsPath } from './lib/env.js';
 import { resolveCodexCommand } from './lib/codex-path.js';
 
@@ -165,6 +165,7 @@ export function apply(ctx, pluginConfig = {}) {
           configFile: { type: 'string', required: true },
           stateDir: { type: 'string', required: true },
           notes: { type: 'array', items: { type: 'string' }, required: true },
+          lastConsult: { type: 'object' },
         },
       },
       render: renderJson,
@@ -178,6 +179,22 @@ export function apply(ctx, pluginConfig = {}) {
       if (!existsSync(cfg.configFile)) {
         notes.push(`配置文件不存在（${cfg.configFile}），当前使用默认值`);
       }
+      // 最近一次会审：让人一眼看出「上一次到底审成了没有」，而不是只看配置。
+      // 老版本失败时只报退出码，调用方可能把「没审成」当成「没意见」。
+      let lastConsult;
+      try {
+        const last = readLastConsult(cfg.stateDir);
+        if (last) {
+          lastConsult = {
+            at: String(last.at || ''),
+            ok: !!last.ok,
+            reason: last.reason === null || last.reason === undefined ? '' : String(last.reason),
+            attempts: Number(last.attempts || 1),
+            ms: Number(last.ms || 0),
+            question: String(last.question || ''),
+          };
+        }
+      } catch { /* 历史文件坏了不该让 status 失败 */ }
       const value = {
         ok: notes.length === 0,
         codexCommand: cfg.codexCommand,
@@ -188,6 +205,7 @@ export function apply(ctx, pluginConfig = {}) {
         configFile: cfg.configFile,
         stateDir: cfg.stateDir,
         notes,
+        ...(lastConsult === undefined ? {} : { lastConsult }),
       };
       return value; // DSH 用 output.schema 校验返回值本身（不是 {content, structuredContent}），渲染交给 render
     },
@@ -287,6 +305,10 @@ export function apply(ctx, pluginConfig = {}) {
           verification: { type: 'string' },
           note: { type: 'string' },
           error: { type: 'string' },
+          reason: { type: 'string' },
+          hint: { type: 'string' },
+          attempts: { type: 'integer' },
+          history: { type: 'string' },
           log: { type: 'string' },
           tail: { type: 'string' },
         },
@@ -325,6 +347,10 @@ export function apply(ctx, pluginConfig = {}) {
         ...(answer.verification === undefined ? {} : { verification: answer.verification }),
         ...(res.note === undefined ? {} : { note: res.note }),
         ...(res.error === undefined ? {} : { error: res.error }),
+        ...(res.reason === undefined ? {} : { reason: res.reason }),
+        ...(res.hint === undefined ? {} : { hint: res.hint }),
+        ...(res.attempts === undefined ? {} : { attempts: res.attempts }),
+        ...(res.history === undefined ? {} : { history: res.history }),
         ...(res.log === undefined ? {} : { log: res.log }),
         ...(res.ok || res.tail === undefined ? {} : { tail: String(res.tail).slice(-2000) }),
         ...(res.raw === undefined ? {} : { tail: String(res.raw).slice(0, 2000) }),

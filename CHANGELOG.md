@@ -1,5 +1,24 @@
 # 变更记录
 
+## 0.1.5 — 2026-10-17
+
+### 修复「会审失败被当成没有意见」
+
+老版本 `tandem_consult` 失败时只回 `{"ok":false,"error":"codex 退出码 1"}`，真实原因
+（上游内容策略拦截 `turn.failed`）躺在日志里没人看 —— 2026-10-17 就因此跳过了一次本该做的会审。
+
+- **失败有名有姓**：从 `--json` 事件流里解析 `turn.failed` 的原文，归类为
+  `policy_blocked` / `auth_failed` / `rate_limited` / `model_not_found` / `empty_response` /
+  `timeout` / `spawn_failed` / `invalid_answer` / `unknown`，并附一条**可执行**的 `hint`
+  （例如策略拦截时明确写「改写措辞后重试；仍被拦就报告未获独立复核，不要跳过会审继续改动」）。
+- **空转自动重试一次**：进程 0 退出却没有任何回答，属瞬时故障，重试 1 次（间隔 2 秒）；
+  其余失败一律不重试（策略拦截、凭据错、模型名错重试只会重复同样的结果）。
+- **四段校验**：结论 / 证据 / 反例 / 验证方式缺任一段或为空 → `invalid_answer`，不算通过。
+- **审计**：每次结果追加一行到 `<stateDir>/consult-history.jsonl`；`tandem_status` 新增
+  `lastConsult`（时间 / 是否成功 / 原因 / 尝试次数 / 问题前 120 字），一眼看出上次到底审成没审成。
+- 新增 `test/consult-classify.mjs`：14 条夹具（8 种失败分类 + 失败原文提取 + 四段校验），
+  `npm test` 两个测试一起跑。
+
 ## 0.1.4 — 2026-10-17
 
 两个都是「独立复审挑出来的、不修就会静默出错」的问题。

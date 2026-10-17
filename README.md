@@ -70,6 +70,25 @@ New-Item -ItemType Junction -Path node_modules\dsh-tandem -Target "D:\dsh\config
 - `maxParallel`：**上限 3**，实测超过 3 会被上游挂住。
 - `requireCompletionMarker`：默认 `true`。Codex 退出码 0 之后，还会检查日志里有没有它固定打印的 `tokens used` 完成标记，没有就判「空跑」并按失败重派。实测过同一份 prompt 一次 37 秒空跑（退出码 0、一个文件没改）、一次 117 秒正常改完，光看退出码分不出来。这是人类可读输出、不是稳定接口，换版本后若失效就设成 `false`。
 
+## 会审失败 ≠ 没有意见
+
+`tandem_consult` 不是「问了就有答案」。它失败时会给出 `reason` 和 `hint` 两个字段，**那不是在说「没问题」**：
+
+| reason | 含义 | 该做什么 |
+|---|---|---|
+| `policy_blocked` | 上游内容策略拦下了提示词 | 改写措辞（去掉可能触发的技术细节）后重试一次 |
+| `auth_failed` / `model_not_found` | 凭据或模型名不对 | 先跑 `tandem_status` 核对 |
+| `rate_limited` | 上游限流 | 等一会儿，别连发 |
+| `empty_response` | 进程正常退出但没产出（空转） | 已自动重试一次；仍空就换个问法 |
+| `invalid_answer` | 不是合法 JSON，或缺四段之一 | 原文在 `tail` 里，据此决定要不要重问 |
+| `timeout` / `spawn_failed` / `unknown` | 超时、启动失败、未能识别 | 缩小材料 / 查路径 / 读 `tail` |
+
+**规则（写在这里就是把话说死）**：`ok:false` 时不许把它当成「审过了、没意见」继续实施改动。
+要么改写措辞重试一次，要么在回复里明写「未获独立复核」并停下来问人。
+
+每一次会审的结果（含失败）都会追加到 `<stateDir>/consult-history.jsonl`，`tandem_status` 的
+`lastConsult` 直接显示最近一次的时间 / 是否成功 / 原因 / 尝试次数 —— 「上次到底审成没审成」不再靠记忆。
+
 ## 凭据
 
 Codex 需要 `PORTDAN_API_KEY`。插件在**加载时**若发现环境变量缺失，会自动从 `~/.dsh/.credentials.yaml` 的 `refs` 段补齐；`tandem_delegate` / `tandem_consult` 每次执行前还会再补一次（幂等），所以后来才写进凭据文件的情况也能赶上。补不到就在 `tandem_status` 里明确报出来。
