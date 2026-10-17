@@ -1,5 +1,14 @@
 # 变更记录
 
+## 0.1.4 — 2026-10-17
+
+两个都是「独立复审挑出来的、不修就会静默出错」的问题。
+
+### 修复
+
+- **完成标记判定太宽，日志内容能伪造它**：0.1.3 引入的 `tokens used` 匹配原来是「日志任意位置出现就行」。但 Codex 会把任务 prompt 原样回显进日志——只要 prompt 或模型正文里出现一行 `tokens used` 紧跟一行数字，失败任务也会被判成成功，重派逻辑就再也不触发。现在正则锚定到**日志结尾**（允许尾部空白）：prompt 里伪造的标记一定出现在真正的 summary 之前，不可能命中。已知限制写在测试里：prompt 恰好以 `tokens used` + 数字结尾、且模型一个字符都没输出时，仍然无法区分。
+- **没配 `model` 时会传 `-m undefined`**：`consult.js` 与 `delegate.js` 原来无条件拼 `-m config.model`。插件内部调用总有默认值，所以这个问题一直没暴露；但用 `runConsult` / `runTasks` 从外部脚本直调（配置里没写 model）时，Codex 会拿 `undefined` 当模型名去请求上游，报 `404 Model "undefined" is not supported ...`，重试 5 次后失败。现在只在配置了 model 时才传 `-m`，否则交给 Codex 自己的 `config.toml`。
+
 ## 0.1.3 — 2026-10-17
 
 派活跑批时抓到的两个真问题，都关于「怎么算跑完了」。
