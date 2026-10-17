@@ -95,6 +95,9 @@ const DEFAULTS = {
   maxParallel: 3,
   workRoots: ['D:/dsh/work'],
   taskTimeoutMs: 300000,
+  // Codex 退出码 0 时还要看日志里有没有 "tokens used" 完成标记，没有就判空跑并重派。
+  // 换 Codex 版本后若这个标记消失，设成 false 关掉（只是少一层保护，不影响派活）。
+  requireCompletionMarker: true,
   envKey: 'PORTDAN_API_KEY',
   configFile: join(homedir(), '.dsh', 'tandem.json'),
   // 插件自己的临时目录（会审的 prompt/schema/日志）。探针 load.log 不受它影响，

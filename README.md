@@ -59,6 +59,7 @@ New-Item -ItemType Junction -Path node_modules\dsh-tandem -Target "D:\dsh\config
   "maxParallel": 3,
   "workRoots": ["D:/dsh/work"],
   "taskTimeoutMs": 300000,
+  "requireCompletionMarker": true,
   "stateDir": "D:/dsh/config/dsh-tandem/state",
   "envKey": "PORTDAN_API_KEY"
 }
@@ -67,6 +68,7 @@ New-Item -ItemType Junction -Path node_modules\dsh-tandem -Target "D:\dsh\config
 - `codexCommand`：留 `codex` 即可，插件会自动探测 npm 全局安装位置，并优先用 `.exe`（Windows 下 spawn `.cmd` 需要额外包一层 cmd.exe）。
 - `workRoots`：允许派活的**目录白名单**——插件会拒绝工作根之外的 `dir`、互相包含或重复的 `dir`。注意它限制的是「任务从哪儿起步」，不是文件写入范围：Codex 以 `danger-full-access` 运行（Windows 沙箱实测会把 `workspace-write` 静默降级成只读，改不了文件），所以白名单挡得住手滑与误配，挡不住任务提示词里明目张胆的越界写入。要真正限制写入，得在 `acceptance` 里自己核验产物路径。
 - `maxParallel`：**上限 3**，实测超过 3 会被上游挂住。
+- `requireCompletionMarker`：默认 `true`。Codex 退出码 0 之后，还会检查日志里有没有它固定打印的 `tokens used` 完成标记，没有就判「空跑」并按失败重派。实测过同一份 prompt 一次 37 秒空跑（退出码 0、一个文件没改）、一次 117 秒正常改完，光看退出码分不出来。这是人类可读输出、不是稳定接口，换版本后若失效就设成 `false`。
 
 ## 凭据
 
@@ -75,6 +77,7 @@ Codex 需要 `PORTDAN_API_KEY`。插件在**加载时**若发现环境变量缺�
 ## 已知限制
 
 - Codex 非 tty 时输出会被吞，所以日志直接写文件（结果里给日志路径）。
+- 「退出码 0」不等于干完活：偶发空跑（进程正常退出、日志只有头部和 prompt、文件没动）。已用完成标记兜住并重派一次，但它只是启发式判定，最终仍要靠 `acceptance` 自己核验产物。
 - 上游缓存命中率不可控（实测 0~80% 波动），同一任务重复跑成本不是线性的。
 - 超时按整棵进程树杀，避免 codex 子进程残留。
 - `tandem_consult` 用 `read-only` 沙箱，它物理上改不了文件——这是刻意的。

@@ -6,6 +6,7 @@
     "D:/dsh/work"
   ],
   "taskTimeoutMs": 300000,
+  "requireCompletionMarker": true,
   "stateDir": "D:/dsh/config/dsh-tandem/state",
   "envKey": "PORTDAN_API_KEY"
 }
