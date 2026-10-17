@@ -1,0 +1,11 @@
+{
+  "codexCommand": "codex",
+  "model": "gpt-6.1-sol",
+  "maxParallel": 3,
+  "workRoots": [
+    "D:/dsh/work"
+  ],
+  "taskTimeoutMs": 300000,
+  "stateDir": "D:/dsh/config/dsh-tandem/state",
+  "envKey": "PORTDAN_API_KEY"
+}

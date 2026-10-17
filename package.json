@@ -1,0 +1,62 @@
+{
+  "name": "dsh-tandem",
+  "version": "0.1.0",
+  "description": "双 agent 协作：让 DSH 主 agent 与本地 Codex(GPT) 共同处理任务——并行派活 + 方案会审，机制由插件保证而不是靠“记得”。",
+  "type": "module",
+  "main": "index.js",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "codex",
+    "multi-agent",
+    "tandem",
+    "parallel"
+  ],
+  "files": [
+    "index.js",
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "config.example.json"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dshhub": {
+    "schemaVersion": 1,
+    "displayName": "dsh-tandem",
+    "summary": "双 agent 协作：主 agent 负责跟你沟通与决策，Codex/GPT 负责并行执行与方案会审。任务缺验收标准直接拒绝派发。",
+    "categories": [
+      "多agent",
+      "效率",
+      "Host"
+    ],
+    "surfaces": [
+      "host"
+    ],
+    "capabilities": {
+      "provides": [
+        "tandem-delegate",
+        "tandem-consult"
+      ]
+    },
+    "compatibility": {
+      "dsh": ">=0.2.0-rc.2",
+      "node": ">=20"
+    },
+    "permissions": {
+      "network": [
+        "本机 Codex CLI 所配置的模型服务"
+      ],
+      "filesystem": [
+        "读取/写入 Codex 任务的工作目录"
+      ]
+    }
+  }
+}

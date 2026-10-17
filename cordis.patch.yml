@@ -1,0 +1,15 @@
+# dsh-tandem —— 双 agent 协作插件
+#
+# 配置写在 ~/.dsh/tandem.json（推荐），或在下面用 config 覆盖。
+# 完整配置项见 README.md 与 config.example.json。
+- insert:
+    - id: dsh-tandem
+      name: dsh-tandem
+      # config:
+      #   codexCommand: codex            # Codex CLI 命令（PATH 内，或绝对路径）
+      #   model: gpt-6.1-sol             # 传给 --model
+      #   maxParallel: 3                 # 并发上限，超过会被拒绝
+      #   workRoots: ['D:/dsh/work']     # 允许派活的目录根（白名单）
+      #   taskTimeoutMs: 300000          # 单任务默认超时
+      #   stateDir: D:/dsh/config/dsh-tandem/state
+      #   envKey: PORTDAN_API_KEY        # 缺失时自动从 ~/.dsh/.credentials.yaml 补
