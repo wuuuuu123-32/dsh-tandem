@@ -34,13 +34,16 @@
 # 1) 装依赖（Codex CLI）
 npm i -g @openai/codex
 
-# 2) 把插件链进桌面端 profile
+# 2) 把插件链进桌面端 profile（先把下面的路径换成你实际存放插件的位置）
 cd ~/.dsh/profiles/desktop
-# package.json: dependencies 里加 "dsh-tandem": "link:变更/发布后的路径"
-#               dsh.profile.bundles 里追加 "dsh-tandem"
-# 在 profile 目录下建目录联接（PowerShell）
-New-Item -ItemType Junction -Path node_modules\dsh-tandem -Target <插件目录>
-# 等价 cmd 写法：mklink /J node_modules\dsh-tandem <插件目录>
+
+# 2a. package.json 改两处：
+#     dependencies 里加一行   "dsh-tandem": "link:D:/dsh/config/dsh-tandem"
+#     dsh.profile.bundles 里追加一项  "dsh-tandem"
+
+# 2b. 在 profile 目录下建目录联接
+New-Item -ItemType Junction -Path node_modules\dsh-tandem -Target "D:\dsh\config\dsh-tandem"
+# 等价 cmd（在同一目录下）：mklink /J node_modules\dsh-tandem "D:\dsh\config\dsh-tandem"
 
 # 3) 重启 DSH（插件在启动时加载，热重载不会加载新插件）
 ```
@@ -62,12 +65,12 @@ New-Item -ItemType Junction -Path node_modules\dsh-tandem -Target <插件目录>
 ```
 
 - `codexCommand`：留 `codex` 即可，插件会自动探测 npm 全局安装位置，并优先用 `.exe`（Windows 下 spawn `.cmd` 需要额外包一层 cmd.exe）。
-- `workRoots`：允许派活的目录白名单，防止 Codex 在工作区外乱写。
+- `workRoots`：允许派活的**目录白名单**——插件会拒绝工作根之外的 `dir`、互相包含或重复的 `dir`。注意它限制的是「任务从哪儿起步」，不是文件写入范围：Codex 以 `danger-full-access` 运行（Windows 沙箱实测会把 `workspace-write` 静默降级成只读，改不了文件），所以白名单挡得住手滑与误配，挡不住任务提示词里明目张胆的越界写入。要真正限制写入，得在 `acceptance` 里自己核验产物路径。
 - `maxParallel`：**上限 3**，实测超过 3 会被上游挂住。
 
 ## 凭据
 
-Codex 需要 `PORTDAN_API_KEY`。插件启动时若发现环境变量缺失，会自动从 `~/.dsh/.credentials.yaml` 的 `refs` 段补齐；补不到就在 `tandem_status` 里明确报出来。
+Codex 需要 `PORTDAN_API_KEY`。插件在**加载时**若发现环境变量缺失，会自动从 `~/.dsh/.credentials.yaml` 的 `refs` 段补齐；`tandem_delegate` / `tandem_consult` 每次执行前还会再补一次（幂等），所以后来才写进凭据文件的情况也能赶上。补不到就在 `tandem_status` 里明确报出来。
 
 ## 已知限制
 
@@ -75,6 +78,7 @@ Codex 需要 `PORTDAN_API_KEY`。插件启动时若发现环境变量缺失，�
 - 上游缓存命中率不可控（实测 0~80% 波动），同一任务重复跑成本不是线性的。
 - 超时按整棵进程树杀，避免 codex 子进程残留。
 - `tandem_consult` 用 `read-only` 沙箱，它物理上改不了文件——这是刻意的。
+  代价：Windows 上 `read-only` 沙箱会把**读取也拦住**（`exec_command ... rejected: blocked by policy`，连 cwd 里的文件都读不到），`cwd` 参数因此在本机不起作用。要让 Codex 会审一个真实项目，就把关键文件的内容拼进 `context` 传给它——实测这样效果正常。这个怪癖只在 Windows 的 Codex 沙箱上出现。
 
 ### 一个刻意的取舍：不做「跑完比对哪些文件被改」
 

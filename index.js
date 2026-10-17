@@ -97,6 +97,9 @@ const DEFAULTS = {
   taskTimeoutMs: 300000,
   envKey: 'PORTDAN_API_KEY',
   configFile: join(homedir(), '.dsh', 'tandem.json'),
+  // 插件自己的临时目录（会审的 prompt/schema/日志）。探针 load.log 不受它影响，
+  // 位置固定为 ~/.dsh/tandem-state/load.log —— 排障入口写死在文档里，不能跟着配置漂。
+  stateDir: join(homedir(), '.dsh', 'tandem-state'),
 };
 
 function readJson(path) {
@@ -125,7 +128,11 @@ export function apply(ctx, pluginConfig = {}) {
   const disposers = [];
   const cfg = resolveConfig(pluginConfig);
   cfg.codexCommand = resolveCodexCommand(cfg.codexCommand);
-  probe('apply start, codex=' + cfg.codexCommand + ', tools service=' + (typeof ctx?.tools));
+
+  // 启动即补凭据：README 承诺「插件启动时补齐」，那就必须在 apply 里做，
+  // 而不是等谁先调一次 tandem_status —— 否则先派活的人会撞上「Codex 缺 API key」。
+  const bootEnv = ensureEnv(cfg.envKey);
+  probe('apply start, codex=' + cfg.codexCommand + ', env=' + bootEnv.source + ', tools service=' + (typeof ctx?.tools));
 
   // 单个工具注册失败不连累其它工具：记录后继续，至少让 tandem_status 能看到问题。
   function register(tool) {
@@ -153,6 +160,7 @@ export function apply(ctx, pluginConfig = {}) {
           workRoots: { type: 'array', items: { type: 'string' }, required: true },
           taskTimeoutMs: { type: 'integer', required: true },
           configFile: { type: 'string', required: true },
+          stateDir: { type: 'string', required: true },
           notes: { type: 'array', items: { type: 'string' }, required: true },
         },
       },
@@ -175,6 +183,7 @@ export function apply(ctx, pluginConfig = {}) {
         workRoots: cfg.workRoots,
         taskTimeoutMs: cfg.taskTimeoutMs,
         configFile: cfg.configFile,
+        stateDir: cfg.stateDir,
         notes,
       };
       return value; // DSH 用 output.schema 校验返回值本身（不是 {content, structuredContent}），渲染交给 render
@@ -235,6 +244,8 @@ export function apply(ctx, pluginConfig = {}) {
       render: renderJson,
     },
     async execute(args, exec) {
+      // 兜底：apply 时凭据文件可能还没写好，用户后补的那种要在派活前再补一次（幂等）。
+      ensureEnv(cfg.envKey);
       const tasks = args?.tasks;
       const errors = validateTasks(tasks, { roots: cfg.roots, maxParallel: cfg.maxParallel });
       if (errors.length > 0) {
@@ -257,6 +268,7 @@ export function apply(ctx, pluginConfig = {}) {
       context: { type: 'string', description: '材料：需求原文、diff 摘要、测试结果、来源摘录' },
       options: { type: 'array', items: { type: 'string' }, description: 'mode=compare 时的候选方案（每条一句话）' },
       timeoutMs: { type: 'integer', description: '超时毫秒；默认 180000，夹在 30000~300000' },
+      cwd: { type: 'string', description: '可选：让 Codex 以这个目录为工作目录（审某个项目时指向它；目录不存在则忽略）' },
     },
     output: {
       schema: {
@@ -279,6 +291,7 @@ export function apply(ctx, pluginConfig = {}) {
       render: renderJson,
     },
     async execute(args) {
+      ensureEnv(cfg.envKey);
       const mode = args?.mode;
       const question = String(args?.question || '').trim();
       const rejected = [];
@@ -294,6 +307,7 @@ export function apply(ctx, pluginConfig = {}) {
         context: args?.context,
         options: Array.isArray(args?.options) ? args.options : [],
         timeoutMs,
+        cwd: args?.cwd,
         config: cfg,
       });
       const answer = res.answer || {};
