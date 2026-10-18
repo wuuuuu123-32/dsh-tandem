@@ -1,6 +1,6 @@
 {
   "name": "dsh-tandem",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "双 agent 协作：让 DSH 主 agent 与本地 Codex(GPT) 共同处理任务——并行派活 + 方案会审 + 机械验收闭环，机制由插件保证而不是靠“记得”。",
   "type": "module",
   "main": "index.js",
@@ -15,7 +15,7 @@
     "acceptance"
   ],
   "scripts": {
-    "test": "node test/completion-marker.mjs && node test/consult-classify.mjs && node test/acceptance.mjs"
+    "test": "node test/completion-marker.mjs && node test/consult-classify.mjs && node test/acceptance.mjs && node test/reviews.mjs && node test/register-smoke.mjs"
   },
   "files": [
     "index.js",
@@ -36,7 +36,7 @@
   "dshhub": {
     "schemaVersion": 1,
     "displayName": "dsh-tandem",
-    "summary": "双 agent 协作：主 agent 负责跟你沟通与决策，Codex/GPT 负责并行执行与方案会审。任务缺验收标准直接拒绝派发；产物可跑机械验收并把缺口回灌重做（最多 2 轮）。",
+    "summary": "双 agent 协作：主 agent 负责跟你沟通与决策，Codex/GPT 负责并行执行与方案会审。任务缺验收标准直接拒绝派发；产物可跑机械验收并把缺口回灌重做（最多 2 轮）；会审成功的凭证（reviewId）随票据落进验收结果，被审内容改动后标记自动过期。",
     "categories": [
       "多agent",
       "效率",

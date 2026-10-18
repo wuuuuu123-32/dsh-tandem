@@ -4,14 +4,14 @@
 
 机制由插件保证，不靠 agent「记得」——参数不合法的派活会被**当场拒绝**。
 
-## 四个工具
+## 五个工具
 
 | 工具 | 作用 | 关键约束 |
 |---|---|---|
 | `tandem_status` | 查看当前是否可用：Codex 路径、模型、并发上限、允许派活的目录根、凭据是否就绪 | 第一次派活前、或派活报错后先看它 |
 | `tandem_delegate` | 把 N 个互不依赖的子任务并行交给 Codex；成功的任务返回 `taskId` | 每项必须给 `timeoutMs` 和 `acceptance`（怎么算干完了），缺失直接拒绝；`dir` 必须在白名单根内且互不重复 |
-| `tandem_consult` | 让 Codex 作为「第二个有边界的判断者」回答一个问题 | 只判断、不写文件；必须回「结论 / 证据 / 反例 / 验证方式」四段，缺段即判无效 |
-| `tandem_check` | 对派活的产物跑机械验收：在任务目录执行命令，按退出码 + 输出包含判定 | 判据在首次检查时**冻结**（同一 taskId 改判据会被拒）；只做门禁，不替代语义审阅 |
+| `tandem_consult` | 让 Codex 作为「第二个有边界的判断者」回答一个问题；成功时签发 `reviewId`（会审标记） | 只判断、不写文件；必须回「结论 / 证据 / 反例 / 验证方式」四段，缺段即判无效 |
+| `tandem_check` | 对派活的产物跑机械验收：在任务目录执行命令，按退出码 + 输出包含判定；返回 `reviewed` / `stale` 与 `review` 标记 | 判据在首次检查时**冻结**（同一 taskId 改判据会被拒）；被审内容在会审后变了则 `stale: true`；只做门禁，不替代语义审阅 |
 | `tandem_reject` | 把验收缺口原样回灌给 Codex 重做（同一 taskId） | 最多 2 轮；要求最近一次检查确实失败；到上限把人拉回来决定 |
 
 ## 什么时候该用
@@ -96,6 +96,32 @@ tandem_check { taskId, checks }   ← 首次调用冻结判据（checks 的哈�
 - 插件只提供**执行器**，不提供独立 oracle；`checks` 由主 agent 写，语义验收仍由主 agent 负责；
 - 不防「Codex 改测试文件/测试脚本」——那只能靠对 diff 的代码审阅；
 - 轮次上限按 taskId 计数，防的是同一任务无限循环，**不是安全边界**（新开任务会重置）。
+
+## 会审标记 reviewId（v0.3.0）
+
+`tandem_consult` 成功（Codex 真回了有效四段答案）时，插件在**本进程内**随机签发一个 `reviewId`（`rv-` + 16 位十六进制），并记下这次会审覆盖的路径。
+
+它标的是**内容**，不是使用配额：
+
+- 同一个 `reviewId` 可以在它覆盖的路径上反复派活、反复检查——没有「一次只能开一个新任务」这种限制；
+- 下次改动不带标记，验收结果就是 `reviewed: false`，明摆着「这段没经过独立复核」；
+- 模型自己编的 id 查不到（`tandem_delegate` 当场拒绝），因为它不在 `reviews.jsonl` 里。
+
+```text
+tandem_consult { mode: "review", question: "...", paths: ["D:/dsh/config/dsh-tandem"] }
+→ { ok: true, reviewId: "rv-1a2b3c4d5e6f7a8b", reviewedPaths: [...] }
+
+tandem_delegate { tasks: [...], reviewId: "rv-1a2b3c4d5e6f7a8b" }
+→ 票据带上标记；tandem_check 返回 reviewed: true 和 review 摘要
+```
+
+**标记会过期。** 签发时同时记下被审路径的内容指纹（源码文件内容 sha1，最多 300 个 / 单文件 1MB 以上退回大小+时间）。之后这些文件被改动，`tandem_check` 就把 `reviewed` 翻成 `false`、给出 `stale: true` 和一句说明——标的是内容，内容变了标记就该失效（盲审指出的假信号：只绑路径的话，换了内容它照样说「审过」）。验收本身照跑，只是不再声称「这段审过」。
+
+指纹只算 `CODE_EXT` 里的扩展名（`.js .mjs .cjs .ts .tsx .jsx .json .md .yml .yaml .py .rs .go .toml .css .html .sh`）。一个目录里没有这类文件时指纹恒定——那种情况下它什么也判断不了，别指望它。
+
+落盘：`<stateDir>/reviews.jsonl`（一行一条，只追加）。轮转保留最近 200 条，且**被票据引用的凭证不会被清掉**——否则证据链会在某次清理后突然断掉。覆盖路径与任务目录不符只提示、不阻断。
+
+边界：这仍然只是**标记**。它证明「有人独立审过」，不证明「审得对」；`reviews.jsonl` 能被手工改写（本机信任模型）。
 
 ## 会审失败 ≠ 没有意见
 

@@ -19,6 +19,7 @@ import { validateTasks, normalizeRoots, runTasks, summarize, runOne, insideRoots
 import { runConsult, readLastConsult, MODES } from './lib/consult.js';
 import { normalizeChecks, checksHash, runChecks, buildGapReport } from './lib/acceptance.js';
 import { loadTickets, saveTickets, getTicket, recordCheck, normalizeDir } from './lib/tickets.js';
+import { findReview, reviewCovers, fingerprintPaths } from './lib/reviews.js';
 import { ensureEnv, credentialsPath } from './lib/env.js';
 import { resolveCodexCommand } from './lib/codex-path.js';
 
@@ -194,6 +195,7 @@ export function apply(ctx, pluginConfig = {}) {
             attempts: Number(last.attempts || 1),
             ms: Number(last.ms || 0),
             question: String(last.question || ''),
+            ...(last.reviewId ? { reviewId: String(last.reviewId) } : {}),
           };
         }
       } catch { /* 历史文件坏了不该让 status 失败 */ }
@@ -233,6 +235,10 @@ export function apply(ctx, pluginConfig = {}) {
           },
         },
       },
+      reviewId: {
+        type: 'string',
+        description: '可选：tandem_consult 成功时签发的标记（形如 rv-xxxxxxxxxxxxxxxx）。带上它，票据与验收结果都会标「这部分改动经过会审」。只标内容、不限次数；没带也能派，结果会标未会审。自己编的 id 查不到，会被当场拒绝。',
+      },
     },
     output: {
       schema: {
@@ -259,10 +265,13 @@ export function apply(ctx, pluginConfig = {}) {
                 timedOut: { type: 'boolean' },
                 error: { type: 'string' },
                 tail: { type: 'string' },
+                reviewed: { type: 'boolean', description: '这次派活是否带了会审标记（要求任务目录在标记覆盖范围内）' },
+                reviewNote: { type: 'string', description: '带了 reviewId 但任务目录不在覆盖范围内时的说明' },
               },
             },
           },
           rejected: { type: 'array', items: { type: 'string' } },
+          review: { type: 'string', description: '会审标记摘要（有标记时）：id、时间、覆盖路径' },
         },
       },
       render: renderJson,
@@ -275,10 +284,50 @@ export function apply(ctx, pluginConfig = {}) {
       if (errors.length > 0) {
         return { total: 0, ok: 0, failed: 0, results: [], rejected: errors };
       }
-      const prepared = tasks.map(task => ({ ...task, timeoutMs: task.timeoutMs || cfg.taskTimeoutMs }));
-      const results = await runTasks(prepared, cfg);
+      // 会审标记：给了就必须是真存在的一条记录（伪造的 id 查不到）。
+      // 没给也能派，只是结果里标 reviewed:false —— 这是内容标记，不是使用配额。
+      let review = null;
+      const wantReview = typeof args?.reviewId === 'string' ? args.reviewId.trim() : '';
+      if (wantReview) {
+        review = findReview(cfg.stateDir, wantReview);
+        if (!review) {
+          return {
+            total: 0,
+            ok: 0,
+            failed: 0,
+            results: [],
+            rejected: [`reviewId 不存在：${wantReview}（只有 tandem_consult 成功时才会签发，不要手写编号）`],
+          };
+        }
+      }
+      const prepared = tasks.map(task => ({
+        ...task,
+        timeoutMs: task.timeoutMs || cfg.taskTimeoutMs,
+        // 只有落在会审覆盖路径内的任务才带标记；其余照样派，但明确不标「审过」。
+        review: review && reviewCovers(review, task.dir) ? review : null,
+      }));
+      const results = (await runTasks(prepared, cfg)).map(r => {
+        const covered = !!(review && reviewCovers(review, r.dir));
+        return {
+          ...r,
+          reviewed: covered,
+          ...(review && !covered ? { reviewNote: '任务目录不在会审覆盖路径内：本次未标记' } : {}),
+          ...(review ? { taskId: r.taskId } : {}),
+        };
+      });
       const summary = summarize(results);
-      return { ...summary, results, rejected: [] };
+      return {
+        ...summary,
+        results,
+        rejected: [],
+        ...(review
+          ? {
+              review: `${review.reviewId} · ${review.at} · ${review.mode}${
+                review.paths && review.paths.length ? ' · 覆盖 ' + review.paths.join(' | ') : ''
+              }`,
+            }
+          : {}),
+      };
     },
   });
   register(delegateTool);
@@ -293,6 +342,11 @@ export function apply(ctx, pluginConfig = {}) {
       options: { type: 'array', items: { type: 'string' }, description: 'mode=compare 时的候选方案（每条一句话）' },
       timeoutMs: { type: 'integer', description: '超时毫秒；默认 180000，夹在 30000~300000' },
       cwd: { type: 'string', description: '可选：让 Codex 以这个目录为工作目录（审某个项目时指向它；目录不存在则忽略）' },
+      paths: {
+        type: 'array',
+        items: { type: 'string' },
+        description: '可选：这次会审覆盖的路径（目录或文件，绝对路径或相对 cwd）。成功时签发的 reviewId 只标这些路径「审过了」；之后派活时带上它，验收结果会显示对应标记。不填则只标到 question 对应的这次判断，不覆盖任何路径。',
+      },
     },
     output: {
       schema: {
@@ -314,6 +368,9 @@ export function apply(ctx, pluginConfig = {}) {
           history: { type: 'string' },
           log: { type: 'string' },
           tail: { type: 'string' },
+          reviewId: { type: 'string', description: '会审通过时签发的标记；派活时带给 tandem_delegate，验收结果里就能看到「这部分审过」' },
+          reviewedPaths: { type: 'array', items: { type: 'string' }, description: '这个标记覆盖的路径' },
+          reviewNote: { type: 'string', description: '没签发标记时的说明（例如未指定 paths）' },
         },
       },
       render: renderJson,
@@ -336,6 +393,7 @@ export function apply(ctx, pluginConfig = {}) {
         options: Array.isArray(args?.options) ? args.options : [],
         timeoutMs,
         cwd: args?.cwd,
+        paths: Array.isArray(args?.paths) ? args.paths : [],
         config: cfg,
       });
       const answer = res.answer || {};
@@ -357,6 +415,9 @@ export function apply(ctx, pluginConfig = {}) {
         ...(res.log === undefined ? {} : { log: res.log }),
         ...(res.ok || res.tail === undefined ? {} : { tail: String(res.tail).slice(-2000) }),
         ...(res.raw === undefined ? {} : { tail: String(res.raw).slice(0, 2000) }),
+        ...(res.reviewId ? { reviewId: res.reviewId } : {}),
+        ...(res.review && res.review.paths && res.review.paths.length ? { reviewedPaths: res.review.paths } : {}),
+        ...(res.reviewNote ? { reviewNote: res.reviewNote } : {}),
       };
     },
   });
@@ -418,6 +479,9 @@ export function apply(ctx, pluginConfig = {}) {
             },
           },
           note: { type: 'string' },
+          reviewed: { type: 'boolean', description: '这次验收的产物是否带有效会审标记（票据有 reviewId 且被审内容未变）' },
+          stale: { type: 'boolean', description: '会审标记存在但已过期（内容在会审后变化）' },
+          review: { type: 'string', description: '会审标记摘要：id · 时间 · 模式 · 覆盖路径' },
         },
       },
       render: renderJson,
@@ -479,12 +543,42 @@ export function apply(ctx, pluginConfig = {}) {
         note = '未提供 taskId：本次不冻结判据、不记账（一次性门禁）';
       }
 
+      // 会审标记：票据上有 reviewId 且查得到 → 标 reviewed:true；查不到（伪造、或已被轮转）就明说，不假装。
+      // 覆盖路径与任务目录不符只提示、不阻断 —— 它是「这块内容审过」的标注，不是使用限制。
+      let reviewLine = null;
+      let reviewed = false;
+      let stale = false;
+      if (ticket && ticket.reviewId) {
+        const rev = findReview(cfg.stateDir, ticket.reviewId);
+        if (rev) {
+          reviewed = true;
+          reviewLine = `${rev.reviewId} · ${rev.at} · ${rev.mode}${rev.paths && rev.paths.length ? ' · 覆盖 ' + rev.paths.join(' | ') : ''}`;
+          if (rev.paths && rev.paths.length && !reviewCovers(rev, targetDir)) {
+            note = (note ? note + '；' : '') + '会审标记的覆盖路径不含本次任务目录（标记只是内容标注，不阻断验收）';
+          }
+          // 内容指纹：会审之后被审内容变了 → 标记失效（盲审坚持：标的是内容，不是路径）。
+          // 这是「标记」不是「门禁」：验收照跑，只是明确告诉调用方「这段现在的样子没审过」。
+          if (rev.fingerprint && rev.paths && rev.paths.length) {
+            if (fingerprintPaths(rev.paths) !== rev.fingerprint) {
+              reviewed = false;
+              stale = true;
+              note = (note ? note + '；' : '') + '标记已过期：被审内容在会审后发生变化，需重新会审才能标「审过」';
+            }
+          }
+        } else {
+          note = (note ? note + '；' : '') + `票据上的会审标记 ${ticket.reviewId} 已查不到（可能被轮转清理）`;
+        }
+      }
+
       return {
         ok: result.ok,
         ...(taskId ? { taskId } : {}),
         dir: targetDir,
         ms: result.ms,
         frozen: !!ticket,
+        reviewed,
+        ...(stale ? { stale: true } : {}),
+        ...(reviewLine ? { review: reviewLine } : {}),
         checks: result.checks.map(c => ({
           index: c.index, cmd: c.cmd, ok: c.ok, ms: c.ms, failures: c.failures,
           ...(c.code === null || c.code === undefined ? {} : { code: c.code }),
