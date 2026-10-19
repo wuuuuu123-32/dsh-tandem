@@ -165,6 +165,7 @@ tandem_delegate { tasks: [...], reviewId: "rv-1a2b3c4d5e6f7a8b" }
 
 - 只跟踪代码类扩展名（与 `reviewId` 的指纹用同一份 `CODE_EXT`：`.js .mjs .cjs .ts .tsx .jsx .json .md .yml .yaml .py .rs .go .toml .css .html .sh`），并跳过 `node_modules`、`.git`、`dist`、`build` 等目录段。只排除**插件自己的 stateDir**，别的同名目录照常记账（一刀切排除 `state` 目录段会让「改动正好落在这种目录下」变成直接绕过，会审挑出过这条）。
 - 相对路径直接跳过：判不出它属于哪个工作目录，猜错会留下永远清不掉的假条目。fs 意图给的本来就是绝对路径。
+- 路径是**词法**比较（`resolve` + win32 小写），不解析符号链接 / junction / subst 盘符 / UNC 别名。同一目录换个写法会被当成不同路径，方向是「多记账」而不是「漏记账」（`.jsonl` 本来就不在跟踪扩展名里，实际影响为零）。
 - 它只知道「有没有一次成功会审覆盖了这个文件」，判断不了「审得够不够」。
 - `present` 不是唯一的交付路径——结论直接写在回复里就不经过它。闸只能覆盖走 `present` 的交付。
 - 账本文件能被手工改写（本机信任模型，与会审标记同一条边界）。

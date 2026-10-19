@@ -4,7 +4,7 @@
  */
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, appendFileSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { apply } from '../index.js';
 import { createLedger, isTrackedPath, extractToolPaths } from '../lib/ledger.js';
 
@@ -162,6 +162,10 @@ console.log('— state 目录：只排除自己的账本目录 —');
   const led = createLedger({ stateDir: stateDir5, firstAt: 1, every: 1 });
   ok(led.note(inState, 's1') === true, '别的 state 目录里的改动照常记账');
   ok(led.note(ownLedger, 's1') === false, '账本自己所在的目录不记账（不会自己记自己）');
+
+  // 会审反例：stateDir 末尾带分隔符（极端情况是盘根 D:\）时，拼出的前缀会带两个分隔符而永远匹配不上
+  const led2 = createLedger({ stateDir: stateDir5 + sep, firstAt: 1, every: 1 });
+  ok(led2.note(ownLedger, 's1') === false, 'stateDir 带尾部分隔符时仍正确排除自己的目录');
 }
 
 console.log('— 账本落盘：DSH 重启不洗白 —');
