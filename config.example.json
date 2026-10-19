@@ -8,5 +8,10 @@
   "taskTimeoutMs": 300000,
   "requireCompletionMarker": true,
   "stateDir": "D:/dsh/config/dsh-tandem/state",
-  "envKey": "PORTDAN_API_KEY"
+  "envKey": "PORTDAN_API_KEY",
+
+  "reviewGuard": true,
+  "reviewGuardFirst": 2,
+  "reviewGuardEvery": 4,
+  "reviewGuardGate": "deny"
 }

@@ -20,6 +20,8 @@ import { runConsult, readLastConsult, MODES } from './lib/consult.js';
 import { normalizeChecks, checksHash, runChecks, buildGapReport } from './lib/acceptance.js';
 import { loadTickets, saveTickets, getTicket, recordCheck, normalizeDir } from './lib/tickets.js';
 import { findReview, reviewCovers, fingerprintPaths } from './lib/reviews.js';
+import { createLedger } from './lib/ledger.js';
+import { randomUUID } from 'node:crypto';
 import { ensureEnv, credentialsPath } from './lib/env.js';
 import { resolveCodexCommand } from './lib/codex-path.js';
 
@@ -106,6 +108,12 @@ const DEFAULTS = {
   // 插件自己的临时目录（会审的 prompt/schema/日志）。探针 load.log 不受它影响，
   // 位置固定为 ~/.dsh/tandem-state/load.log —— 排障入口写死在文档里，不能跟着配置漂。
   stateDir: join(homedir(), '.dsh', 'tandem-state'),
+  // 会审闸：把 AGENTS.md 的「共审第二判」从自觉变成可观测判据（改了哪些文件 vs 有没有会审覆盖）。
+  // reviewGuard=false 全关；reviewGuardGate='off' 只保留提醒、不拦 present。
+  reviewGuard: true,
+  reviewGuardFirst: 2,   // 未审文件达到几个才第一次提醒
+  reviewGuardEvery: 4,   // 之后每多几个再提醒一次
+  reviewGuardGate: 'deny',
 };
 
 function readJson(path) {
@@ -125,6 +133,12 @@ export function resolveConfig(pluginConfig = {}) {
   merged.maxParallel = Number(merged.maxParallel) > 0 ? Math.min(Number(merged.maxParallel), 8) : DEFAULTS.maxParallel;
   merged.taskTimeoutMs = Number(merged.taskTimeoutMs) > 0 ? Number(merged.taskTimeoutMs) : DEFAULTS.taskTimeoutMs;
   merged.roots = normalizeRoots(merged.workRoots);
+  merged.reviewGuard = merged.reviewGuard !== false;
+  merged.reviewGuardFirst = Number(merged.reviewGuardFirst) >= 1
+    ? Math.min(Math.floor(Number(merged.reviewGuardFirst)), 50) : DEFAULTS.reviewGuardFirst;
+  merged.reviewGuardEvery = Number(merged.reviewGuardEvery) >= 1
+    ? Math.min(Math.floor(Number(merged.reviewGuardEvery)), 50) : DEFAULTS.reviewGuardEvery;
+  merged.reviewGuardGate = merged.reviewGuardGate === 'off' ? 'off' : 'deny';
   return merged;
 }
 
@@ -139,6 +153,15 @@ export function apply(ctx, pluginConfig = {}) {
   // 而不是等谁先调一次 tandem_status —— 否则先派活的人会撞上「Codex 缺 API key」。
   const bootEnv = ensureEnv(cfg.envKey);
   probe('apply start, codex=' + cfg.codexCommand + ', env=' + bootEnv.source + ', tools service=' + (typeof ctx?.tools));
+
+  // 改动账本：任何走 fs 服务的写入都进这里（含 run_code 里的嵌套调用）。
+  // 目的只有一个 —— 让「这轮改了哪些文件、有没有会审覆盖」变成插件能查到的事实，而不是靠模型自述。
+  const ledger = createLedger({
+    stateDir: cfg.stateDir,
+    firstAt: cfg.reviewGuardFirst,
+    every: cfg.reviewGuardEvery,
+    log: msg => probe('ledger ' + msg),
+  });
 
   // 单个工具注册失败不连累其它工具：记录后继续，至少让 tandem_status 能看到问题。
   function register(tool) {
@@ -169,6 +192,7 @@ export function apply(ctx, pluginConfig = {}) {
           stateDir: { type: 'string', required: true },
           notes: { type: 'array', items: { type: 'string' }, required: true },
           lastConsult: { type: 'object' },
+          reviewGuard: { type: 'object' },
         },
       },
       render: renderJson,
@@ -199,6 +223,16 @@ export function apply(ctx, pluginConfig = {}) {
           };
         }
       } catch { /* 历史文件坏了不该让 status 失败 */ }
+      let reviewGuard;
+      try {
+        reviewGuard = {
+          enabled: !!cfg.reviewGuard,
+          gate: cfg.reviewGuardGate,
+          firstAt: cfg.reviewGuardFirst,
+          every: cfg.reviewGuardEvery,
+          ...ledger.summary(),
+        };
+      } catch { /* 账本坏了不该让 status 失败 */ }
       const value = {
         ok: notes.length === 0,
         codexCommand: cfg.codexCommand,
@@ -210,6 +244,7 @@ export function apply(ctx, pluginConfig = {}) {
         stateDir: cfg.stateDir,
         notes,
         ...(lastConsult === undefined ? {} : { lastConsult }),
+        ...(reviewGuard === undefined ? {} : { reviewGuard }),
       };
       return value; // DSH 用 output.schema 校验返回值本身（不是 {content, structuredContent}），渲染交给 render
     },
@@ -679,6 +714,113 @@ export function apply(ctx, pluginConfig = {}) {
     },
   });
   register(rejectTool);
+
+  /** 从 exec / actor 上取会话身份（内核把 agent 挂在 exec.agent 上）。 */
+  function sessionOf(actor) {
+    try {
+      const agent = actor && actor.agent;
+      if (!agent) return '';
+      const session = agent.session;
+      if (typeof session === 'string') return session;
+      if (session && typeof session.id === 'string') return session.id;
+      if (typeof agent.id === 'string') return agent.id;
+    } catch {}
+    return '';
+  }
+
+  // 复刻 @deepseek-ai/dsh-llm 的 createUserMessage 形状（不能 import：profile 的 node_modules 里没有这个包）。
+  // source.kind 必须存在，否则这条消息会被当成真人用户消息。
+  function notice(text) {
+    return {
+      role: 'user',
+      id: randomUUID(),
+      content: [{ type: 'text', text }],
+      source: { kind: 'dsh-tandem', form: 'notice', summary: text.slice(0, 110) },
+    };
+  }
+
+  function withNotice(downstream, text) {
+    const rest = Array.isArray(downstream && downstream.additionalContexts) ? downstream.additionalContexts : [];
+    if (downstream && downstream.kind === 'block') {
+      return { kind: 'block', feedback: downstream.feedback, additionalContexts: [notice(text), ...rest] };
+    }
+    return { ...(downstream || {}), additionalContexts: [notice(text), ...rest] };
+  }
+
+  /**
+   * 会审闸的三条线。
+   * 由来：AGENTS.md 的「共审第二判」原先靠模型自觉，2026-10-19 那次性能优化 6 处改动一次没审，
+   * 事后还能给出「我检查过了」。自觉不可验证，所以把判据落到可观测事件上。
+   * 硬约束：每个 hook 体自己 try/catch、始终 return next() —— 插件绝不能把宿主的工具链写崩。
+   */
+  function installReviewGuard() {
+    // 主数据源：fs 写意图。必须 prepend —— dsh-fs-observation-policy 注册时 arity 2、不调 next()，
+    // 排在它后面就永远轮不到我（见 dsh-fs-observation-policy/lib/index.js:90-91）。
+    const onIntent = (target, actor, next) => {
+      try {
+        const p = target && (target.displayPath || target.path);
+        if (p) ledger.note(p, sessionOf(actor));
+      } catch (error) {
+        probe('fs intent guard failed: ' + (error && error.message));
+      }
+      return next();
+    };
+    disposers.push(ctx.on('fs/write-intent', onIntent, { prepend: true }));
+    disposers.push(ctx.on('fs/edit-intent', onIntent, { prepend: true }));
+
+    // 兜底 + 提醒：ops_replace / ops_batch 走外部 ops 服务、不过 fs 服务，只能从参数里认路径。
+    disposers.push(ctx.on('tools/post-execute', async (exec, _result, next) => {
+      const downstream = await next(); // 下游异常原样上抛，不吞
+      try {
+        const session = sessionOf(exec);
+        ledger.noteToolPaths(exec && exec.name, exec && exec.arguments, session);
+        // present 走交付分支：先推进提醒水位（交付时已经说过一次，不该紧接着再蹦一条），
+        // 再落一条交付账 —— 第一次被拦、第二次放行，这个放行不能在沉默里发生。
+        let text = null;
+        if (exec && exec.name === 'present') {
+          ledger.reminder(session);
+          if (cfg.reviewGuardGate === 'deny') text = ledger.deliveryWarning(session, 'present');
+        } else {
+          text = ledger.reminder(session);
+        }
+        if (text) {
+          probe('review guard notice -> session ' + (session || '(unknown)') + ' via ' + (exec && exec.name));
+          return withNotice(downstream, text);
+        }
+      } catch (error) {
+        probe('post-execute guard failed: ' + (error && error.message));
+      }
+      return downstream;
+    }));
+
+    // 交付闸：present 之前还有未审改动就拦一次。同一批未审改动只拦一次 —— 拦的用途是强制一次注意，
+    // 不是保证「所有交付路径都被覆盖」（present 本来就不是唯一交付路径，别假装它是）。
+    disposers.push(ctx.on('tools/pre-execute', async (exec, next) => {
+      try {
+        if (cfg.reviewGuardGate === 'deny' && exec && exec.name === 'present') {
+          const text = ledger.gate(sessionOf(exec));
+          if (text) {
+            probe('review guard gate denied present');
+            return { kind: 'deny', reason: text, info: { name: 'TandemReviewGate', code: 'REVIEW_REQUIRED', reason: text } };
+          }
+        }
+      } catch (error) {
+        probe('pre-execute guard failed: ' + (error && error.message));
+      }
+      return next();
+    }));
+  }
+
+  if (cfg.reviewGuard) {
+    try {
+      installReviewGuard();
+      probe('review guard installed');
+    } catch (error) {
+      probe('review guard INSTALL FAILED: ' + (error && (error.stack || error.message)));
+    }
+  } else {
+    probe('review guard disabled by config');
+  }
 
   return () => {
     for (const dispose of disposers.reverse()) {

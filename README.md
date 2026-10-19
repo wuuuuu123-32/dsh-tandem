@@ -123,6 +123,53 @@ tandem_delegate { tasks: [...], reviewId: "rv-1a2b3c4d5e6f7a8b" }
 
 边界：这仍然只是**标记**。它证明「有人独立审过」，不证明「审得对」；`reviews.jsonl` 能被手工改写（本机信任模型）。
 
+## 会审闸：让「改了没审」自己冒出来（v0.4.x）
+
+前面的 `reviewId` 是**自愿**机制——agent 自己要带上标记。实测的失效方式很朴素：主 agent 一口气改完代码、直接回复用户，全程没想起会审，而任何人（包括用户）当场都看不出来。
+
+会审闸把这件事改成插件负责：**每个会话维护一份改动账本，未经会审的改动会在提醒、拦截、留痕三个位置自己暴露。**
+
+| 位置 | 干什么 |
+|---|---|
+| `fs/write-intent` / `fs/edit-intent` | **记账**。任何走 DSH fs 服务的写入 / 编辑都记下绝对路径，PTC 嵌套调用里的写操作同样经过这条线。这是主数据源——不从工具参数里猜路径 |
+| `tools/post-execute` | **提醒**。未审文件数到阈值就注入一条 user 消息（`source.kind = "dsh-tandem"`，不会被当成真人发言），点名具体文件 |
+| `tools/pre-execute` | **拦截**。`present` 在还有未审改动时被拒一次，带机器可读的 `code: "REVIEW_REQUIRED"` |
+
+配置（`config.example.json` 里都有）：
+
+```json
+{
+  "reviewGuard": true,
+  "reviewGuardFirst": 2,
+  "reviewGuardEvery": 4,
+  "reviewGuardGate": "deny"
+}
+```
+
+`reviewGuardFirst` 是第一次提醒的未审文件数（**不是等到第 3 个**——第一次出现未审改动就该说话），之后按 `reviewGuardEvery` 递增再提醒。`reviewGuardGate` 设成 `"off"` 则只提醒、不拦 `present`。
+
+**闸只拦一次，但放行不沉默。** 第二次 `present` 放行——否则 agent 重试一下就永远交付不出去，闸会变成死锁而不是约束。代价是「拦一次」本身拦不住决心要交付的人，所以放行时补两件事：
+
+- 往对话里注入一条明示「这次交付含 N 个未经会审的改动」，让这件事出现在用户眼前，而不是烂在插件内部；
+- 往 `<stateDir>/deliveries.jsonl` 落一条 `{at, session, action, count, files}`，事后可查。
+
+**重启不洗白。** 账本落盘在 `<stateDir>/ledger.jsonl`（一行 `{path, t}`，超过 400 行压到最近 200 条），插件启动时读回。DSH 重启一次就把未审状态清零，是这套机制最容易被打穿的地方——重启后一样拦得住、一样认那次已经发生过的会审。
+
+### 判定规则
+
+每个改动文件取 `t = max(记账时刻, 当前 mtime)`；从最新的会审记录往前扫，找到一条 `at > t` 且覆盖该路径的会审就算已审，扫到 `at <= t` 就停。
+
+两个后果值得写清：**旧会审清不掉新改动**（时间条件天然挡住「拿一个月前的会审复用」）；**用 `utimesSync` 之类绕过 fs 钩子改 mtime 也会被重新判成未审**（mtime 越过会审时间即重新变脏）。
+
+### 能力边界
+
+- 只跟踪代码类扩展名（与 `reviewId` 的指纹用同一份 `CODE_EXT`：`.js .mjs .cjs .ts .tsx .jsx .json .md .yml .yaml .py .rs .go .toml .css .html .sh`），并跳过 `node_modules`、`.git`、`dist`、`build` 等目录段。只排除**插件自己的 stateDir**，别的同名目录照常记账（一刀切排除 `state` 目录段会让「改动正好落在这种目录下」变成直接绕过，会审挑出过这条）。
+- 相对路径直接跳过：判不出它属于哪个工作目录，猜错会留下永远清不掉的假条目。fs 意图给的本来就是绝对路径。
+- 它只知道「有没有一次成功会审覆盖了这个文件」，判断不了「审得够不够」。
+- `present` 不是唯一的交付路径——结论直接写在回复里就不经过它。闸只能覆盖走 `present` 的交付。
+- 账本文件能被手工改写（本机信任模型，与会审标记同一条边界）。
+- 文件被删掉后从账本摘除（记账 10 秒后生效，窗口内可能短暂误报，取的是保守方向）。
+
 ## 会审失败 ≠ 没有意见
 
 `tandem_consult` 不是「问了就有答案」。它失败时会给出 `reason` 和 `hint` 两个字段，**那不是在说「没问题」**：
@@ -203,8 +250,11 @@ DSH **不写运行日志**，插件加载失败在界面上毫无提示（工具
 node --check index.js
 node --check lib/consult.js
 node --check lib/acceptance.js
+node --check lib/ledger.js
 # 机械验收 + 票据单测（含会审给的反例：echo PASS && exit 1、notContains 假阳性、超时）
 node test/acceptance.mjs
+# 会审闸单测：账本判定、重启不洗白、交付留痕、三个 hook 的装配
+node test/guard.test.mjs
 # 假 ctx 走一遍 apply，确认五个工具都注册成功
 node -e "import('./index.js').then(m=>{const r=[];m.apply({tools:{register:d=>{r.push(d.name);return()=>{}}}});console.log(r)})"
 ```
