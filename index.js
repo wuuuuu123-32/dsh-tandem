@@ -21,6 +21,7 @@ import { normalizeChecks, checksHash, runChecks, buildGapReport } from './lib/ac
 import { loadTickets, saveTickets, getTicket, recordCheck, normalizeDir } from './lib/tickets.js';
 import { findReview, reviewCovers, fingerprintPaths } from './lib/reviews.js';
 import { createLedger } from './lib/ledger.js';
+import { createRescue } from './lib/rescue.js';
 import { randomUUID } from 'node:crypto';
 import { ensureEnv, credentialsPath } from './lib/env.js';
 import { resolveCodexCommand } from './lib/codex-path.js';
@@ -114,6 +115,16 @@ const DEFAULTS = {
   reviewGuardFirst: 2,   // 未审文件达到几个才第一次提醒
   reviewGuardEvery: 4,   // 之后每多几个再提醒一次
   reviewGuardGate: 'deny',
+  // 自动求援：会话在一个目标上转了很久、用户又一直没开口时，插件自己把真实轨迹发给 Codex 看一眼。
+  // 判据故意宽 —— 真实样本（APK 逆向会话）证明「重复动作 + 相同报错」那类判据几乎不响；
+  // 判断交给外部模型，插件只负责「到点问一句」。autoRescue=false 全关。
+  autoRescue: true,
+  rescueAfterCalls: 15,      // 自最后一条用户消息以来的工具调用数
+  rescueAfterMin: 10,        // 且距最后一条用户消息至少这么多分钟
+  rescueCooldownMin: 20,     // 两次求援之间至少隔这么久
+  rescueMaxPerSession: 3,    // 单个会话最多问几次（嫌吵调小，1 = 只问一次）
+  rescueTimeoutMs: 150000,   // 自动求援的等待上限，超时也注入「未获独立意见」
+  rescueTtlMin: 30,          // 结论的有效期：超时不硬塞（挂死场景要等工具超时回来，别给太短）
 };
 
 function readJson(path) {
@@ -822,7 +833,53 @@ export function apply(ctx, pluginConfig = {}) {
     probe('review guard disabled by config');
   }
 
+  // 自动求援：与会审闸分开装 —— 关掉 reviewGuard 的人仍然要能享受求援。
+  // 挂 tools/post-execute 而不是 pre-execute：求援不拦任何动作，只在下一次工具返回时捎一句话。
+  let rescueTimer = null;
+  const rescue = cfg.autoRescue ? createRescue({ config: cfg, probe }) : null;
+  try {
+    if (rescue) {
+      disposers.push(ctx.on('tools/post-execute', async (exec, _result, next) => {
+        const downstream = await next();
+        try {
+          const text = rescue.observe(exec && exec.agent && exec.agent.session);
+          if (text) {
+            probe('auto rescue notice delivered');
+            return withNotice(downstream, text);
+          }
+        } catch (error) {
+          probe('auto rescue failed: ' + (error && (error.stack || error.message)));
+        }
+        return downstream;
+      }));
+      // 单次工具调用自己挂住时 post-execute 永远不会回来 —— 那种情况只有 timer 看得见。
+      rescueTimer = setInterval(() => {
+        try {
+          rescue.tick();
+        } catch (error) {
+          probe('auto rescue tick failed: ' + (error && error.message));
+        }
+      }, 60000);
+      if (rescueTimer && typeof rescueTimer.unref === 'function') rescueTimer.unref();
+      probe(
+        'auto rescue installed (calls>=' + cfg.rescueAfterCalls + ', idle>=' + cfg.rescueAfterMin +
+        'm, cooldown ' + cfg.rescueCooldownMin + 'm, max ' + cfg.rescueMaxPerSession + '/session)'
+      );
+    } else {
+      probe('auto rescue disabled by config');
+    }
+  } catch (error) {
+    // 装不上也不许拖垮整个插件（四个工具还要能用）—— 但必须留下痕迹，别静默。
+    probe('auto rescue INSTALL FAILED: ' + (error && (error.stack || error.message)));
+  }
+
   return () => {
+    if (rescueTimer) {
+      try { clearInterval(rescueTimer); } catch {}
+    }
+    if (rescue) {
+      try { rescue.dispose(); } catch {}
+    }
     for (const dispose of disposers.reverse()) {
       try { dispose(); } catch {}
     }

@@ -7,7 +7,13 @@
 import assert from 'node:assert/strict';
 
 const registered = [];
+const hooks = [];
 const ctx = {
+  // 必须提供 on()：求援与会审闸都走 tools/post-execute，缺了它插件会整段装不上。
+  on(name) {
+    hooks.push(name);
+    return () => {};
+  },
   tools: {
     register(tool) {
       assert.ok(tool && typeof tool.name === 'string' && tool.name, '工具必须有 name');
@@ -28,4 +34,7 @@ await mod.apply(ctx, {});
 
 const want = ['tandem_status', 'tandem_delegate', 'tandem_consult', 'tandem_check', 'tandem_reject'];
 assert.deepEqual(registered.slice().sort(), want.slice().sort(), `注册结果不符：${registered.join(', ')}`);
+const post = hooks.filter((h) => h === 'tools/post-execute').length;
+assert.ok(post >= 2, `tools/post-execute 应有会审闸 + 求援两个钩子，实际 ${post}（hooks: ${hooks.join(', ')}）`);
 console.log('✅ 五个工具全部注册成功：' + registered.join(', '));
+console.log('✅ 钩子已挂：' + hooks.join(', '));

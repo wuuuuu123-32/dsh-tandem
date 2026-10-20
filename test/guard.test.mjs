@@ -94,15 +94,34 @@ console.log('— 插件挂钩（假 ctx 触发三个 hook）—');
   const stateDir2 = join(root, 'state2');
   mkdirSync(stateDir2, { recursive: true });
   const registered = [];
+  // 一个事件名可以挂多个钩子（会审闸 + 求援都挂 tools/post-execute）—— 用数组存，
+  // 否则后注册者会把先注册的覆盖掉，测出来的是假象。
   const handlers = new Map();
   const ctx = {
     tools: { register: (tool) => { registered.push(tool); return () => {}; } },
-    on: (name, fn, opts) => { handlers.set(name, { fn, opts }); return () => handlers.delete(name); },
+    on: (name, fn, opts) => {
+      if (!handlers.has(name)) handlers.set(name, []);
+      handlers.get(name).push({ fn, opts });
+      return () => {};
+    },
+  };
+  const hookAt = (name, i = 0) => (handlers.get(name) || [])[i]?.fn;
+  const hookOpts = (name, i = 0) => (handlers.get(name) || [])[i]?.opts;
+  // 多个同名钩子串成 waterfall：先注册的在外层，最后看到下游结果（与 DSH 的叠加顺序一致）。
+  const chain = (name, exec, result = { kind: 'ok' }) => {
+    const list = handlers.get(name) || [];
+    let next = () => Promise.resolve(result);
+    for (let i = list.length - 1; i >= 0; i--) {
+      const fn = list[i].fn;
+      const inner = next;
+      next = () => fn(exec, {}, inner);
+    }
+    return next();
   };
   const dispose = apply(ctx, { stateDir: stateDir2, configFile: join(root, 'no-such.json'), reviewGuard: true, reviewGuardFirst: 2, reviewGuardEvery: 4 });
   ok(typeof dispose === 'function', 'apply 返回 dispose');
   ok(registered.length === 5, '注册了 5 个工具', String(registered.length));
-  ok(handlers.has('fs/write-intent') && handlers.get('fs/write-intent').opts?.prepend === true, 'fs/write-intent 以 prepend 注册');
+  ok(handlers.has('fs/write-intent') && hookOpts('fs/write-intent')?.prepend === true, 'fs/write-intent 以 prepend 注册');
   ok(handlers.has('fs/edit-intent'), 'fs/edit-intent 已注册');
   ok(handlers.has('tools/post-execute') && handlers.has('tools/pre-execute'), '工具前后钩子已注册');
 
@@ -110,22 +129,22 @@ console.log('— 插件挂钩（假 ctx 触发三个 hook）—');
   const E1 = join(root, 'src', 'e1.js');
   const E2 = join(root, 'src', 'e2.js');
   writeFileSync(E1, 'x'); writeFileSync(E2, 'y');
-  const intent = handlers.get('fs/write-intent').fn;
+  const intent = hookAt('fs/write-intent');
   let nextCalled = 0;
   const nextFn = () => { nextCalled++; return Promise.resolve({ kind: 'createIfAbsent' }); };
   const intentResult = await intent({ targetKey: 'k', displayPath: E1 }, session, nextFn);
   ok(nextCalled === 1 && intentResult.kind === 'createIfAbsent', 'fs 意图放行并原样返回下游决策');
   await intent({ targetKey: 'k', displayPath: E2 }, session, nextFn);
 
-  const post = handlers.get('tools/post-execute').fn;
-  const downstream = await post({ name: 'write', arguments: {}, agent: { session: 'sess-1' } }, {}, () => Promise.resolve({ kind: 'ok' }));
+  const post = (exec, result) => chain('tools/post-execute', exec, result);
+  const downstream = await post({ name: 'write', arguments: {}, agent: { session: 'sess-1' } });
   const injected = downstream.additionalContexts?.[0];
   ok(!!injected && injected.role === 'user', '提醒以 user 消息注入');
   ok(injected?.source?.kind === 'dsh-tandem' && injected.source.form === 'notice', 'source.kind/form 正确（不会被当成真人消息）');
   ok(typeof injected?.id === 'string' && injected.id.length > 0, '消息带 id');
   ok(injected?.content?.[0]?.text?.includes('E1'.replace('E1', 'e1.js')) || injected?.content?.[0]?.text?.includes('e1.js'), '提醒里点了名');
 
-  const pre = handlers.get('tools/pre-execute').fn;
+  const pre = hookAt('tools/pre-execute');
   const deny = await pre({ name: 'present', arguments: {}, agent: { session: 'sess-1' } }, () => Promise.resolve({ kind: 'allow' }));
   ok(deny.kind === 'deny' && typeof deny.reason === 'string' && deny.reason.includes('present'), 'present 首次被拦');
   ok(deny.info?.code === 'REVIEW_REQUIRED', '拦截带机器可读 code');
@@ -135,14 +154,14 @@ console.log('— 插件挂钩（假 ctx 触发三个 hook）—');
   ok(other.kind === 'allow', '其它工具完全不受影响');
 
   // 放行不能是沉默的：第二次 present 之后必须往对话里说明「这次交付含未审改动」
-  const presentPost = await post({ name: 'present', arguments: {}, agent: { session: 'sess-1' } }, {}, () => Promise.resolve({ kind: 'ok' }));
+  const presentPost = await post({ name: 'present', arguments: {}, agent: { session: 'sess-1' } });
   const presentNote = presentPost.additionalContexts?.[0]?.content?.[0]?.text || '';
   ok(presentNote.includes('未经会审'), 'present 放行时明示「含未审改动」', presentNote.slice(0, 60));
   ok(presentNote.includes('e1.js') || presentNote.includes('E1'), '明示里带了具体路径');
 
   // 会审覆盖 E1/E2 之后，闸自动解除
   review('rv-3', later(300000), [join(root, 'src')], stateDir2);
-  const post2 = await post({ name: 'write', arguments: {}, agent: { session: 'sess-1' } }, {}, () => Promise.resolve({ kind: 'ok' }));
+  const post2 = await post({ name: 'write', arguments: {}, agent: { session: 'sess-1' } });
   ok(!post2.additionalContexts, '覆盖之后不再提醒');
   const statusTool = registered.find(t => t.name === 'tandem_status');
   const status = await statusTool.execute({});
