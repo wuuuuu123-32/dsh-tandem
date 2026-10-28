@@ -1,6 +1,6 @@
 {
   "name": "dsh-tandem",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "双 agent 协作：让 DSH 主 agent 与本地 Codex(GPT) 共同处理任务——并行派活 + 方案会审 + 机械验收闭环，机制由插件保证而不是靠“记得”。",
   "type": "module",
   "main": "index.js",
@@ -15,7 +15,7 @@
     "acceptance"
   ],
   "scripts": {
-    "test": "node test/completion-marker.mjs && node test/consult-classify.mjs && node test/acceptance.mjs && node test/reviews.mjs && node test/register-smoke.mjs && node test/guard.test.mjs && node test/rescue.test.mjs"
+    "test": "node test/completion-marker.mjs && node test/consult-classify.mjs && node test/acceptance.mjs && node test/reviews.mjs && node test/register-smoke.mjs && node test/guard.test.mjs && node test/rescue.test.mjs && node test/failover-edge.mjs"
   },
   "files": [
     "index.js",

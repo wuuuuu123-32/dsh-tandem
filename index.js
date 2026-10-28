@@ -16,7 +16,7 @@ import { existsSync, readFileSync, appendFileSync, mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { validateTasks, normalizeRoots, runTasks, summarize, runOne, insideRoots } from './lib/delegate.js';
-import { runConsult, readLastConsult, MODES } from './lib/consult.js';
+import { runConsult, readLastConsult, MODES, CONSULT_PROVIDERS } from './lib/consult.js';
 import { normalizeChecks, checksHash, runChecks, buildGapReport } from './lib/acceptance.js';
 import { loadTickets, saveTickets, getTicket, recordCheck, normalizeDir } from './lib/tickets.js';
 import { findReview, reviewCovers, fingerprintPaths } from './lib/reviews.js';
@@ -386,7 +386,11 @@ export function apply(ctx, pluginConfig = {}) {
       question: { type: 'string', required: true, description: '要判断的问题本身，需自包含（Codex 看不到本对话）' },
       context: { type: 'string', description: '材料：需求原文、diff 摘要、测试结果、来源摘录' },
       options: { type: 'array', items: { type: 'string' }, description: 'mode=compare 时的候选方案（每条一句话）' },
-      timeoutMs: { type: 'integer', description: '超时毫秒；默认 180000，夹在 30000~300000' },
+      provider: { type: 'string', enum: ['portdan', 'aisz'], description: '可选：用哪条上游会审。portdan = gpt-6.1-sol，aisz = gpt-6.1-terra。不填就用本插件固定的 portdan（模型 gpt-6.1-sol），不读 Codex 全局配置里的 model —— 换句话说，这里不填和填 portdan 是同一件事。填了视为钉死，只问这一条。' },
+      dual: { type: 'boolean', description: '可选：同时问遍布两条上游，两份回答都返回，用来对照两家的失败率、速度与判断差异。开了它就忽略 provider。' },
+      timeoutMs: { type: 'integer', description: '单次尝试的超时毫秒；默认 180000，夹在 30000~300000' },
+      failover: { type: 'boolean', description: '可选：主上游失败后是否自动换另一条上游再问一次（默认开）。只有没显式指定 provider 时才生效；显式指定 provider 视为钉死，传 true 可强制打开。本机执行器故障、缺环境变量、内容被策略拦截这三种情况不会切换（换后端只会同样失败，或等于绕过策略）。' },
+      deadlineMs: { type: 'integer', description: '可选：整次会审的总预算毫秒（含重试与切换），默认 timeoutMs×2，夹在 60000~900000。到点就收手，不会把多次单次超时累加成总时长。三条实际限制要知道：(1) 后面还有备用后端时，每次给主端算超时会先扣掉 90000ms 预留，否则主端两次慢失败就能把预算吃干、备用一次都起不来；注意这是「扣给后面」，不保证备用真能拿到 90000ms —— 主端第一次仍可能占满 timeoutMs，预留只在后续每次计算时才生效，且还要再被下面两条继续压缩；(2) 备用 aisz 单次最多 120000ms（即使你给的 timeoutMs 和剩余预算更大）；(3) 剩余预算不足 18000ms 时不会启动任何新尝试（其中 3000ms 是留给自己清理进程与写盘的）。预算挡下后续尝试时，返回里会有 stoppedBy=budget 与 budgetNote，此时 reason 只代表最后一次真正跑完的尝试。' },
       cwd: { type: 'string', description: '可选：让 Codex 以这个目录为工作目录（审某个项目时指向它；目录不存在则忽略）' },
       paths: {
         type: 'array',
@@ -410,13 +414,69 @@ export function apply(ctx, pluginConfig = {}) {
           error: { type: 'string' },
           reason: { type: 'string' },
           hint: { type: 'string' },
-          attempts: { type: 'integer' },
+          attempts: { type: 'integer', description: '总共尝试了几次（含重试与切换）' },
+          failoverFrom: { type: 'string', description: '发生跨后端切换时被让位的那个上游（例如 portdan）；没切换就没有这个键' },
+          attemptsLog: {
+            type: 'array',
+            description: '每次尝试的明细，用来看清「主端为什么失败」与「切换后是否成功」',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                provider: { type: 'string', required: true },
+                ok: { type: 'boolean', required: true },
+                ms: { type: 'integer', required: true },
+                reason: { type: 'string' },
+                timeoutMs: { type: 'integer', required: true },
+                started: { type: 'boolean', description: 'false = 这一条没有真的启动 Codex（准备阶段就发现预算不够），不是上游失败' },
+              },
+            },
+          },
           history: { type: 'string' },
           log: { type: 'string' },
           tail: { type: 'string' },
           reviewId: { type: 'string', description: '会审通过时签发的标记；派活时带给 tandem_delegate，验收结果里就能看到「这部分审过」' },
           reviewedPaths: { type: 'array', items: { type: 'string' }, description: '这个标记覆盖的路径' },
           reviewNote: { type: 'string', description: '没签发标记时的说明（例如未指定 paths）' },
+          provider: { type: 'string', description: '这次实际用的上游（attemptsLog 里最后一次的那个）。不填 provider 时是 default = 本插件固定的 portdan（gpt-6.1-sol），不读 Codex 全局配置里的 model' },
+          stoppedBy: { type: 'string', description: '为什么没跑完：值是 budget 表示总预算不足，后续重试或换后端被挡下了' },
+          budgetNote: { type: 'string', description: '预算挡下后续尝试时的说明（此时 reason 只代表最后一次真正跑完的尝试）' },
+          dual: {
+            type: 'array',
+            description: 'dual=true 时才有：两条上游各自的回答，按 portdan、aisz 顺序',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                provider: { type: 'string', required: true },
+                ok: { type: 'boolean', required: true },
+                ms: { type: 'integer', required: true },
+                conclusion: { type: 'string' },
+                evidence: { type: 'array', items: { type: 'string' } },
+                counterexamples: { type: 'array', items: { type: 'string' } },
+                verification: { type: 'string' },
+                reason: { type: 'string' },
+                hint: { type: 'string' },
+                attempts: { type: 'integer' },
+                failoverFrom: { type: 'string' },
+                attemptsLog: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    additionalProperties: false,
+                    properties: {
+                      provider: { type: 'string', required: true },
+                      ok: { type: 'boolean', required: true },
+                      ms: { type: 'integer', required: true },
+                      reason: { type: 'string' },
+                      timeoutMs: { type: 'integer', required: true },
+                      started: { type: 'boolean', description: 'false = 这一条没有真的启动 Codex（准备阶段就发现预算不够），不是上游失败' },
+                    },
+                  },
+                },
+              },
+            },
+          },
         },
       },
       render: renderJson,
@@ -431,8 +491,13 @@ export function apply(ctx, pluginConfig = {}) {
       if (rejected.length) {
         return { ok: false, mode: String(mode || ''), ms: 0, error: rejected.join('; ') };
       }
+      const providerName = args?.provider ? String(args.provider).trim() : '';
+      if (providerName && !CONSULT_PROVIDERS[providerName]) {
+        // 不静默降级：写错名字却按默认上游跑，等于「以为换了 judging 者，其实没换」。
+        return { ok: false, mode, ms: 0, error: 'provider 只支持 ' + Object.keys(CONSULT_PROVIDERS).join(' / ') + '，收到「' + providerName + '」' };
+      }
       const timeoutMs = Math.min(Math.max(Number(args?.timeoutMs) || 180000, 30000), 300000);
-      const res = await runConsult({
+      const baseArgs = {
         mode,
         question,
         context: args?.context,
@@ -441,6 +506,67 @@ export function apply(ctx, pluginConfig = {}) {
         cwd: args?.cwd,
         paths: Array.isArray(args?.paths) ? args.paths : [],
         config: cfg,
+        failover: typeof args?.failover === 'boolean' ? args.failover : null,
+        deadlineMs: Math.min(Math.max(Number(args?.deadlineMs) || timeoutMs * 2, 60000), 900000),
+      };
+      // 双轨：同一问题同时送给两条上游。两边独立跑，谁先回来都不影响另一个。
+      // 注意 dual 下不签发 reviewId —— 两份回答互相独立，无法声称「覆盖了某个 diff」。
+      if (args?.dual === true) {
+        const names = Object.keys(CONSULT_PROVIDERS);
+        // paths 清空：dual 是「两份独立意见」，不能声称覆盖了某段 diff，否则 reviewId 会被误用。
+        // allSettled 而不是 all：一条上游在 runConsult 之外抛异常（写文件、建目录失败）
+        // 时，另一条的结果不能跟着丢 —— 那种情况下调用方会当成「两家都没意见」。
+        const dualStart = Date.now();
+        const outs = await Promise.allSettled(names.map(p => runConsult({ ...baseArgs, paths: [], provider: p })));
+        const dual = outs.map((s, i) => {
+          if (s.status === 'rejected') {
+            return {
+              provider: names[i],
+              ok: false,
+              // 不能用 0：这条可能已经真的调用过上游才抛的（runConsult 里写历史、发 review 票据都在上游调用之后）。
+              // 标 0 会让统计把它当成「一次上游都没发」，把真实成本与失败率一起算漏。
+              // ⚠但这不是这一条自己的耗时，而是 dual 到此刻的墙钟（两条并行，s 结束时间本就不同），
+              // 只能当上界看；要精确耗时看 ok 那条返回的 ms。
+              ms: Date.now() - dualStart,
+              reason: 'thrown',
+              hint: '这条抛异常了（可能发生在真的调用上游之后，例如写历史或发票据时抛）；ms 是 dual 到此刻的墙钟上界，不是这一条自己的耗时。原始错误：' + String((s.reason && s.reason.message) || s.reason).slice(0, 300),
+            };
+          }
+          const r = s.value;
+          const a = r.answer || {};
+          return {
+            provider: r.provider || names[i],
+            ok: !!r.ok,
+            ms: Number(r.ms) || 0,
+            ...(a.conclusion === undefined ? {} : { conclusion: a.conclusion }),
+            ...(a.evidence === undefined ? {} : { evidence: a.evidence }),
+            ...(a.counterexamples === undefined ? {} : { counterexamples: a.counterexamples }),
+            ...(a.verification === undefined ? {} : { verification: a.verification }),
+            ...(r.reason === undefined ? {} : { reason: r.reason }),
+            ...(r.hint === undefined ? {} : { hint: r.hint }),
+            ...(r.attempts === undefined ? {} : { attempts: r.attempts }),
+            // 同一后端第一次失败的原因原本在 dual 里看不到，只能看到一个总 reason
+            ...(r.failoverFrom ? { failoverFrom: r.failoverFrom } : {}),
+            ...(Array.isArray(r.attemptsLog) && r.attemptsLog.length ? { attemptsLog: r.attemptsLog } : {}),
+          };
+        });
+        const bothOk = dual.every(d => d && d.ok);
+        return {
+          ok: bothOk,
+          mode,
+          ms: Math.max(0, ...dual.map(d => d.ms)),
+          note: (bothOk ? 'dual 模式：两份回答都在 dual 里，逐条对照后再下判断；'
+              : 'dual 模式但有上游失败（看各条的 reason/hint）；failed 的那条不能当成「没意见」；')
+            + 'dual 下已忽略 provider 入参，也不签发 reviewId（两份独立意见不等于覆盖了某段改动）',
+          dual,
+        };
+      }
+      // 单路上游：baseArgs 已经含 failover / deadlineMs，漏传这两个会让
+      // 「失败自动换后端」和「总预算封顶」在非 dual 路径上整体失效。
+      // providerName 为空时不要塞 provider:''，否则 runConsult 会当成显式钉死某家。
+      const res = await runConsult({
+        ...baseArgs,
+        ...(providerName ? { provider: providerName } : {}),
       });
       const answer = res.answer || {};
       // 不用 undefined 占位：快照要求无损 JSON，缺键比 undefined 安全。
@@ -448,6 +574,7 @@ export function apply(ctx, pluginConfig = {}) {
         ok: res.ok,
         mode,
         ms: res.ms,
+        ...(res.provider === undefined ? {} : { provider: res.provider }),
         ...(answer.conclusion === undefined ? {} : { conclusion: answer.conclusion }),
         ...(answer.evidence === undefined ? {} : { evidence: answer.evidence }),
         ...(answer.counterexamples === undefined ? {} : { counterexamples: answer.counterexamples }),
@@ -457,6 +584,8 @@ export function apply(ctx, pluginConfig = {}) {
         ...(res.reason === undefined ? {} : { reason: res.reason }),
         ...(res.hint === undefined ? {} : { hint: res.hint }),
         ...(res.attempts === undefined ? {} : { attempts: res.attempts }),
+        ...(res.failoverFrom ? { failoverFrom: res.failoverFrom } : {}),
+        ...(Array.isArray(res.attemptsLog) && res.attemptsLog.length ? { attemptsLog: res.attemptsLog } : {}),
         ...(res.history === undefined ? {} : { history: res.history }),
         ...(res.log === undefined ? {} : { log: res.log }),
         ...(res.ok || res.tail === undefined ? {} : { tail: String(res.tail).slice(-2000) }),

@@ -1,5 +1,46 @@
 # 变更记录
 
+## 0.6.0 — 2026-10-28
+
+### 新增：会审失败自动换后端（failover）
+
+用户的原话是「如果遇到会审失败两次就该去问 terra」。原来的行为是两次失败就结束、把决定权交回给用户；现在默认会自己换到另一条上游再问一次：`portdan`（gpt-6.1-sol）两次 → `aisz`（gpt-6.1-terra）一次。
+
+**切换表（刻意的取舍，不是漏配）**
+
+| 失败原因 | 重试同一后端 | 换后端 |
+|---|---|---|
+| `empty_response` / `rate_limited` / `unknown` / `model_not_found` / `invalid_answer` | 是 | 是 |
+| `auth_failed` / `timeout` | 不重试 | 是 |
+| `spawn_failed` / 缺环境变量 | 否 | 否（本机执行器问题，换后端只会同样失败） |
+| `policy_blocked` | 否 | 否（内容级拦截，换后端再问等于绕过策略） |
+
+**预算**：`deadlineMs` 默认 `timeoutMs × 2`、夹在 60 到 900 秒，是所有尝试共享的一个总时钟。有备用在后面时，每次给主端算超时会扣掉 90 秒预留——这是「扣给后面」，不保证备用真能拿到 90 秒。备用单次上限 120 秒；剩余不足 18 秒不再启动新尝试（其中 3 秒留给清理与写盘）。
+
+**新增返回字段**：`failoverFrom`（备用真的启动过才出现，成功失败都记）、`attemptsLog`（每条的 provider/ok/ms/timeoutMs/reason/started；`started:false` 表示进程没起来、不算一次尝试）、`stoppedBy` + `budgetNote`（后续尝试被预算挡下，此时 `reason` 只代表最后一次真跑完的尝试）、dual 模式下每项也带 `attemptsLog` 与 `failoverFrom`。
+
+### 四轮会审修掉的缺陷（全部 ok:true，均落地）
+
+1. **超时与退出有竞态**：旧写法先 `await killTree` 再落结论，退出事件可能先到，把超时记成「退出码非 0」→ 触发一次毫无意义的同后端重试。现在超时一触发先占位，之后一律记 `timeout`。
+2. **deadline 只在尝试入口检查**：准备阶段（建目录、写文件、加载凭据、启动进程）没有截止约束。现在 spawn 之前再查一次，剩余不足 5 秒直接返回 `budget_exhausted` 且标 `notStarted`。
+3. **慢失败耗光预算**：主端两次各占满 `timeoutMs` 后备用根本起不来。加了 90 秒预留与 15/18 秒门槛。
+4. **预算阻止不可见**：只回上次失败 reason，看不出是预算挡的。加了 `stoppedBy` / `budgetNote`。
+5. **killTree 无硬上限会让 deadline 失效**：清理加了 5 秒兜底（且不超过剩余到 deadline），并分三态如实报告「已杀 / 杀失败 / 未清完，可能仍有残余进程」。
+6. **`killing.catch(() => {})` 吞掉拒绝**：原来杀失败也报「已杀进程树」，现在区分 `killState`。
+7. **`failoverFrom` 语义**：原只在备用成功时设置，失败时漏统计「发生过切换」；且原在尝试前就设，预算挡下时会谎报已切换。现在只在该 stage 真的有尝试跑过之后才设。
+8. **进程没起来却被记成一次尝试**：`attempts++` 后才发现 `budget_exhausted`，现改为回退 `attempts--` 并带 `started:false`。
+9. **公开契约与实现矛盾**：参数说明称「显式 provider + `failover:true` 可强制切换」但代码只建单后端（已实现）；返回字段 `provider` 描述称「沿用 Codex 全局配置」但实际固定用表内 portdan（已改口）；双处 `attemptsLog` schema 补 `started`。
+10. **`appendReview` 写失败仍签发 reviewId**：没落盘的标记查不到，等于空头凭证。现在写失败置 `review = null` 并在 `reviewNote` 说明原因。
+11. **dual rejected 分支的 hint 断言不准**：`ms` 改标为「dual 到此刻的墙钟上界」，hint 改成「可能发生在真的调用上游之后」。
+12. **分类漏检**：策略拦截、鉴权、限流、模型不存在的正则都扩了；策略关键词漏网会落进 `unknown` 导致重试并切换，等于绕过内容策略。分类单测 14 → 22 条。
+
+### 测试
+
+- `npm test` 58 条通过（含新 `test/failover-edge.mjs` 五个桩场景：默认三尝试 / `failover:false` 两尝试 / 钉死不切 / 强制切换 / 主动指定备用时 `failoverFrom=aisz`）。
+- `test/register-smoke.mjs` 重写：五个工具与关键 schema 字段缺失即失败，hook 回调必须是函数（原来只记 event、静默通过）。
+- 真上游端到端：T2 主端两次 `model_not_found`（23.4s + 23.4s）→ 备用 ok（21.2s），`failoverFrom=portdan`，`attempts=3`，总 70s。
+- `test/failover-timeout.mjs` 两处踩坑后稳定：同一问题第二次问会命中上游缓存 15 秒内答完（假阳性失败）、短问题本来就可能 10 秒内答完 → 改成随机编号 + 240 条材料逐字复述。
+
 ## 0.5.0 — 2026-10-20
 
 ### 新增：自动求援（会话转久了主动问一次 Codex）

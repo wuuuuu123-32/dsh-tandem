@@ -36,6 +36,18 @@ t('超时优先 → timeout', classifyFailure({ code: 1, logText: policyLog, tim
 t('spawn 失败 → spawn_failed', classifyFailure({ code: null, logText: '', error: '启动失败：ENOENT' }), 'spawn_failed');
 t('不可识别 → unknown', classifyFailure({ code: 1, logText: line({ type: 'turn.failed', error: { message: 'boom' } }) }), 'unknown');
 
+// 第二组：各家上游对同一类失败的措辞不同。只认 portdan 那一种，别家的拦截/限流/模型错
+// 会全掉进 unknown —— 而 unknown 既能重试又能切换，等于把「内容被拦」当成「上游抖动」处理。
+const fail = (m) => line({ type: 'turn.failed', error: { message: m } });
+t('OpenAI 风格的安全拦截 → policy_blocked', classifyFailure({ code: 1, logText: fail('Your request was rejected as a result of our safety system.') }), 'policy_blocked');
+t('内容过滤措辞 → policy_blocked', classifyFailure({ code: 1, logText: fail('Output blocked: content filtering policy.') }), 'policy_blocked');
+t('invalid_prompt 错误码 → policy_blocked', classifyFailure({ code: 1, logText: fail('400 invalid_prompt: request rejected') }), 'policy_blocked');
+t('Incorrect API key → auth_failed', classifyFailure({ code: 1, logText: fail('Incorrect API key provided: sk-xxx') }), 'auth_failed');
+t('余额不足 → auth_failed（凭据没错但这家用不了）', classifyFailure({ code: 1, logText: fail('403: {"message":"insufficient balance","type":"billing_error"}') }), 'auth_failed');
+t('并发限流措辞 → rate_limited', classifyFailure({ code: 1, logText: fail('gateway_concurrency_limit reached') }), 'rate_limited');
+t('分组里没有该模型 → model_not_found', classifyFailure({ code: 1, logText: fail('{"code":"model_not_found","message":"Model gpt-x is not available for this group"}') }), 'model_not_found');
+t('模型不存在（英文变体）→ model_not_found', classifyFailure({ code: 1, logText: fail('The model gpt-x does not exist') }), 'model_not_found');
+
 t('能取出 turn.failed 原文', extractFailure(policyLog).includes('flagged'), true);
 t('正常日志不误判为失败原文', extractFailure(okLog), '');
 
