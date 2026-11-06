@@ -224,6 +224,51 @@ tandem_delegate { tasks: [...], reviewId: "rv-1a2b3c4d5e6f7a8b" }
 每一次会审的结果（含失败）都会追加到 `<stateDir>/consult-history.jsonl`，`tandem_status` 的
 `lastConsult` 直接显示最近一次的时间 / 是否成功 / 原因 / 尝试次数 —— 「上次到底审成没审成」不再靠记忆。
 
+## 会审后端链路：当天首次用 portdan，其余优先免费额度（v0.7.0）
+
+会审不再固定一条链路，而是按「今天是不是第一次」决定先问谁：
+
+| 情形 | 顺序 |
+|---|---|
+| 当天第一次 | `portdan`（gpt-6.1-sol）→ `tokenfuture`（gpt-6.1-sol）→ `aisz`（gpt-6.1-terra） |
+| 当天其余 | `tokenfuture` → `portdan` → `aisz` |
+| `tokenfuture` 报了没余额之后的 24 小时内 | 跳过 `tokenfuture`，其余不变 |
+| 显式传了 `provider` | 钉死那一家（要切换得再传 `failover:true`） |
+| `failover:false` | 只问 `portdan` |
+
+**为什么要有「当天第一次」这条**：两家跑的其实是同一个模型，质量实测同档（GPQA 80 题 93.75% 对 91.78%，McNemar p 约 0.68），差别只在钱 —— tokenfuture 是白送的额度，portdan 按量计费。所以默认先烧免费的，但每天留一次付费调用：一是确认 portdan 那条路还活着（它不会因为不用就一直被验证），二是免费额度哪天突然清零时，至少当天还有一次能用的会审。
+
+**状态落在哪**：拆成两个文件，都在 `<stateDir>`（默认 `~/.dsh/tandem-state/`）里：
+
+| 文件 | 内容 | 谁写 |
+|---|---|---|
+| `portdan-used.json` | `{"day":"2026-11-07","at":1793988494505}` | 当天首次 portdan 真的启动之后 |
+| `tf-exhausted.json` | `{"at":1793990000000,"reason":"insufficient balance"}` | tokenfuture 报没余额时 |
+
+拆开是因为两者的生命周期不同：日期每天翻、退避按 24 小时算。合在一个文件里，任何一次写入都会把另一半的快照带回去 —— 「A 读到旧冷却 → B 清掉 → A 又写回去」，冷却就复活了。同理，写任一文件时缺的那一半从**磁盘现值**补，不从内存快照补。
+
+旧版的 `provider-state.json` 仍然能读，但只在对应的新文件不存在时兜底；两个新文件都在时完全不看它，否则显式清除掉的冷却会被旧文件里那份复活。
+
+**并发怎么保证只有一个进程是「今天第一次」**：认领用 `openSync(<stateDir>/portdan-day-YYYY-MM-DD.lock, 'wx')` 建锁，这一步是内核级原子的。锁已经存在且 mtime 超过 30 分钟算陈旧，用 `renameSync` 把文件抢到一个随机名下 —— rename 同样是原子的，两个进程同时抢只有一个能改名成功，改成功的那个人独占那个 inode。
+
+关键是不「先 stat 再删」：看和删之间别人可能已经把旧锁删掉、换成自己的新锁，你删的就是别人的。释放也走同一条路 —— 先 rename 抢过来，读里面的 pid，确认是自己的才 unlink，不是就 `linkSync` 放回去。读内容和删除从此作用于同一个 inode。
+
+读改写 JSON 做不到这点：两个进程都会读到「今天还没用过」，然后都去用 portdan，付费次数直接翻倍。
+
+**日期只按本地时区切**：用 `toISOString()` 会按 UTC 切天，东八区凌晨 8 点前都会被算成前一天，「每天一次」就变成「每 32 小时一次」。
+
+**「今天用过了」只在 portdan 真的启动之后才写**：如果它因为预算不足压根没起来，写了等于把当天的付费名额扔掉，而它一次都没跑。锁文件留着（那是「谁抢到了」的凭据），但 `lastPortdanDay` 要等这一轮真的启动才落盘；同一天再调用时 `planStages` 先看 `lastPortdanDay`，看到是今天就根本不认领，因此也不会出现「同一天两轮都首选 portdan」。
+
+**余额耗尽单独成一类 `no_balance`**：口令是 `insufficient balance/quota`、`insufficient_quota`、`exceeded your current quota`、`billing_hard_limit`、`payment required`、`out of credit`、`(balance|credit|account|funds) is (exhausted|depleted|used up|empty)`、`余额不足`、`额度不足`、`余额已用完`、`余额耗尽` 这些。它和 `auth_failed` 的区别很实际 —— 凭据没错，只是这家今天没钱了，应当立刻换下一家并把这家停用一阵；归成 `auth_failed` 会让人跑去查 key。`policy_blocked` 排在它前面判，内容拦截不会被余额正则抢走。
+
+**裸的 `quota exceeded` 故意不算余额不足**：Codex 在普通限流时也会打 `429 rate limit: quota exceeded`，按余额处理会把白送的免费额度白停 24 小时。限流措辞先判，只有当整条信息不匹配任何限流词时才落到余额正则。
+
+**`no_balance` 只对 `tokenfuture` 生效**：portdan 或 aisz 欠费时不能写进 tf 的退避状态，否则会因为一个不相干的错误把免费额度停用 24 小时。
+
+**怎么手动恢复**：删掉 `tf-exhausted.json` 就立刻恢复使用 tf；删掉当天的 `portdan-day-*.lock` 会让下一次重新以 portdan 打头（`portdan-used.json` 也要一起清，否则 `planStages` 看到今天已用过还是不认领）。
+
+**每家自带 base_url**：Codex 侧用 `-c model_providers.<name>.base_url=... / .env_key=... / .wire_api=responses` 传进去，不依赖 `~/.codex/config.toml` 里有没有声明。旧版靠全局配置，换台机器装插件就会静默走错网关或者直接 404。
+
 ## 失败自动换后端（v0.6.0）
 
 主上游两次都失败时，自动换另一条上游再问一次。默认：`portdan`（gpt-6.1-sol）问 2 次 → `aisz`（gpt-6.1-terra）问 1 次。
@@ -320,6 +365,8 @@ node --check lib/ledger.js
 node test/acceptance.mjs
 # 会审闸单测：账本判定、重启不洗白、交付留痕、三个 hook 的装配
 node test/guard.test.mjs
+# 会审链路单测：当天首次/非首次、tf 退避、跨天、pin 与 failover:false、状态文件损坏
+node test/consult-chain.mjs
 # 假 ctx 走一遍 apply，确认五个工具都注册成功
 node -e "import('./index.js').then(m=>{const r=[];m.apply({tools:{register:d=>{r.push(d.name);return()=>{}}}});console.log(r)})"
 ```

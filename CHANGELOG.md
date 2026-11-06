@@ -1,5 +1,62 @@
 # 变更记录
 
+## 0.7.0 — 2026-11-07
+
+### 会审后端改成「当天首次 portdan、其余优先免费额度」的链路
+
+用户的原话是「每天第一次调用 codex 会审使用 portdan 的 gpt，其余的优先用 tf 的，tf 没余额了就用 pd，在此基础上 pd 出问题又我们之前测的那个 Terra 的站」。
+
+链路（`planStages`，纯函数、可单测）：
+
+| 情形 | 顺序 |
+|---|---|
+| 当天第一次 | portdan → tokenfuture → aisz |
+| 当天其余 | tokenfuture → portdan → aisz |
+| tf 在没余额退避期内 | 跳过 tokenfuture |
+| 显式 `provider` | 钉死；`failover:true` 才补一条 |
+| `failover:false` | 只问 portdan |
+
+**并发认领**：<stateDir>/portdan-used-YYYY-MM-DD.json 用 `openSync(..., 'wx')` 建 —— 创建成功即「今天这一次归我」，EEXIST 即别人已经拿到。**一个系统调用就是全部判定**，没有「先读后删」或「先改名再放回」的窗口。
+
+早先试过在单一锁文件上用 `rename` 抢占来回收崩溃残留，被会审指出致命交错：rename 会把原路径腾空，第三个进程能在那瞬间 `openSync` 成功，于是**两个进程都以为自己拥有当天资格**，付费次数翻倍。改成按天分文件后谁也不删谁的文件，这个交错不存在了。代价是崩溃残留会让那天剩下时间不再首选 portdan —— 只损失一次付费优先权，可以接受。
+
+**日期按本地时区**（`localDay()`），不用 `toISOString()`：后者按 UTC 切天，东八区会把凌晨算成前一天。
+
+**`lastPortdanDay` 只在 portdan 真的启动之后才写**：预算不足被截停时它一次都没跑，写了等于白扔当天的付费优先权。
+
+### 新增失败类 `no_balance`
+
+`insufficient balance/quota`、`insufficient_quota`、`exceeded your current quota`、`credit balance is too low`、`credits exhausted`、`余额不足`、`余额已耗尽` 等归到这里，**从 `auth_failed` 里拆出来**：凭据没错，只是这家今天没钱，应当立刻换下家并停用一阵。
+
+**限流优先于余额**：`rate limit / too many requests / concurrency limit` 命中且不含明确的余额措辞时，一律判 `rate_limited`。否则一句 `429 rate limit: quota exceeded` 就会把 tokenfuture 停用 24 小时。裸的 `quota exceeded` 已从余额正则里删掉 —— 太泛，两个意思都占。
+
+- 不重试同一后端（再问还是没钱），但会换后端。
+- **只对 tokenfuture 生效**：别的后端欠费不会写进 tf 的退避状态。
+- `policy_blocked` 仍排在它前面判 —— 内容拦截不会被余额正则抢走。
+
+### 每家自带 base_url
+
+Codex 侧改用 `-c model_providers.<name>.base_url / .env_key / .wire_api=responses` 传入，不再依赖 `~/.codex/config.toml`。旧写法在没声明过 provider 的机器上会直接 404 或静默走错网关。
+
+### 实现复查后修正（同版本内）
+
+第一轮实现被会审逐条挑出，改动如下：
+
+- **当天已用过 portdan 就不再认领**。只用锁判断不够：portdan 第一次真跑过（已写 `lastPortdanDay`），同一次调用里第二次尝试因预算不足被截停会把锁还回去，下一次 `planStages` 又会首选 portdan —— 当天变成两次首选。现在先看 `lastPortdanDay`（以及当天认领文件是否存在）再决定要不要认领。
+- **预算不足只跳过当前后端**。原来 `break` 会掉进循环末尾的 `!last || !SWITCHABLE → break outer`，把后两家一起掐掉 —— 配了故障切换却永远切不过去。现在 `continue outer`，剩余预算留给后面的备用。实测 180s 预算 + 三阶段：主端跳过，第二家拿到 87s。
+- **状态拆成两个文件**：`portdan-used.json` 与 `tf-exhausted.json`，各自 pid 临时文件 + `renameSync` 原子写。原来单文件「读—合并—写」会让两个并发会审互相覆盖。
+- **写入不抄磁盘旧值**：缺的字段写 `null`。原来「补缺失字段时读磁盘现值」仍有「A 读旧冷却 → B 清除 → A 落盘」的窗口，冷却会复活。宁可少记一次冷却，也不要白停 24 小时。
+- **旧 `provider-state.json` 只在对应新文件不存在时才兜底**。
+- **余额措辞补全**：`has been exhausted`、`funds have been depleted`、`余额为0` 此前会漏判（带着 429 就落进 `rate_limited`，永远不会冷却）。
+
+### 其它
+
+- `tandem_status` 新增 `consultChain`：今天是否已用过 portdan、下次会选谁、tf 是否在退避期及原因。
+- 新增 `test/consult-chain.mjs`（20 条，不联网）：当日首次/非首次、tf 冷却与过期、跨天、pin 与 `failover:false`、状态文件损坏、时区切天、每家都有 baseURL。
+- 新增 `test/chain-state.mjs`（37 条，不联网）：状态两文件互不覆盖、只给半个字段不复活冷却、单次 `wx` 认领只有一个成功、未标 started 可归还而跑过的不许归还、当天已用不再认领、180s 预算下主端不启动而第二家拿到机会。
+- `consult-classify.mjs` 补 12 条 + 第四轮的 6 条（`has been exhausted`、`余额为0`、`funds have been depleted` 判 `no_balance`；`quota exceeded`、`Too Many Concurrent` 仍判 `rate_limited`），共 43 条。
+- `failover-edge.mjs` 增断言：`attempts` 必须与「真正启动的条数」一致。
+
 ## 0.6.0 — 2026-10-28
 
 ### 新增：会审失败自动换后端（failover）

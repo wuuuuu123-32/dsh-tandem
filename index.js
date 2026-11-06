@@ -16,7 +16,7 @@ import { existsSync, readFileSync, appendFileSync, mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { validateTasks, normalizeRoots, runTasks, summarize, runOne, insideRoots } from './lib/delegate.js';
-import { runConsult, readLastConsult, MODES, CONSULT_PROVIDERS } from './lib/consult.js';
+import { runConsult, readLastConsult, MODES, CONSULT_PROVIDERS, readProviderState, localDay, tfCoolingDown } from './lib/consult.js';
 import { normalizeChecks, checksHash, runChecks, buildGapReport } from './lib/acceptance.js';
 import { loadTickets, saveTickets, getTicket, recordCheck, normalizeDir } from './lib/tickets.js';
 import { findReview, reviewCovers, fingerprintPaths } from './lib/reviews.js';
@@ -186,7 +186,7 @@ export function apply(ctx, pluginConfig = {}) {
 
   const statusTool = defineTool({
     name: 'tandem_status',
-    description: '查看 dsh-tandem 的当前配置与可用性：Codex 命令是否可解析、模型、并发上限、允许派活的工作根、单任务默认超时。在第一次派活之前或派活报错之后调用它确认配置。',
+    description: '查看 dsh-tandem 的当前配置与可用性：Codex 命令是否可解析、模型、并发上限、允许派活的工作根、单任务默认超时，以及会审后端链的当前状态（今天是否已用过 portdan、下次会选谁、tokenfuture 是否在没余额的退避期）。在第一次派活之前或派活报错之后调用它确认配置。',
     parameters: {},
     output: {
       schema: {
@@ -204,6 +204,7 @@ export function apply(ctx, pluginConfig = {}) {
           notes: { type: 'array', items: { type: 'string' }, required: true },
           lastConsult: { type: 'object' },
           reviewGuard: { type: 'object' },
+          consultChain: { type: 'object' },
         },
       },
       render: renderJson,
@@ -244,6 +245,26 @@ export function apply(ctx, pluginConfig = {}) {
           ...ledger.summary(),
         };
       } catch { /* 账本坏了不该让 status 失败 */ }
+      // 会审后端的当前状态：今天是否已经用过 portdan、tf 是否在「没余额」退避期内。
+      // 没有这块的话，「为什么这次走了 aisz」只能去翻 provider-state.json 才知道。
+      let consultChain;
+      try {
+        const st = readProviderState(cfg.stateDir);
+        const today = localDay();
+        const cooling = tfCoolingDown(st);
+        consultChain = {
+          providers: Object.keys(CONSULT_PROVIDERS),
+          lastPortdanDay: st.lastPortdanDay ? String(st.lastPortdanDay) : '',
+          usedPortdanToday: st.lastPortdanDay === today,
+          today,
+          nextPick: st.lastPortdanDay === today ? (cooling ? 'portdan' : 'tokenfuture') : 'portdan',
+          tokenfuture: {
+            coolingDown: cooling,
+            exhaustedAt: Number(st.tfExhaustedAt) > 0 ? new Date(Number(st.tfExhaustedAt)).toISOString() : '',
+            reason: st.tfExhaustedReason ? String(st.tfExhaustedReason).slice(0, 160) : '',
+          },
+        };
+      } catch { /* 状态坏了不该让 status 失败 */ }
       const value = {
         ok: notes.length === 0,
         codexCommand: cfg.codexCommand,
@@ -256,6 +277,7 @@ export function apply(ctx, pluginConfig = {}) {
         notes,
         ...(lastConsult === undefined ? {} : { lastConsult }),
         ...(reviewGuard === undefined ? {} : { reviewGuard }),
+        ...(consultChain === undefined ? {} : { consultChain }),
       };
       return value; // DSH 用 output.schema 校验返回值本身（不是 {content, structuredContent}），渲染交给 render
     },
@@ -386,10 +408,10 @@ export function apply(ctx, pluginConfig = {}) {
       question: { type: 'string', required: true, description: '要判断的问题本身，需自包含（Codex 看不到本对话）' },
       context: { type: 'string', description: '材料：需求原文、diff 摘要、测试结果、来源摘录' },
       options: { type: 'array', items: { type: 'string' }, description: 'mode=compare 时的候选方案（每条一句话）' },
-      provider: { type: 'string', enum: ['portdan', 'aisz'], description: '可选：用哪条上游会审。portdan = gpt-6.1-sol，aisz = gpt-6.1-terra。不填就用本插件固定的 portdan（模型 gpt-6.1-sol），不读 Codex 全局配置里的 model —— 换句话说，这里不填和填 portdan 是同一件事。填了视为钉死，只问这一条。' },
+      provider: { type: 'string', enum: ['portdan', 'tokenfuture', 'aisz'], description: '可选：钉死某条上游。portdan / tokenfuture 都是 gpt-6.1-sol，aisz 是 gpt-6.1-terra。不填就走链：当天第一次 portdan → tokenfuture → aisz，之后 tokenfuture → portdan → aisz（tf 报没余额后 24 小时内跳过它）。填了视为钉死，只问这一条。' },
       dual: { type: 'boolean', description: '可选：同时问遍布两条上游，两份回答都返回，用来对照两家的失败率、速度与判断差异。开了它就忽略 provider。' },
       timeoutMs: { type: 'integer', description: '单次尝试的超时毫秒；默认 180000，夹在 30000~300000' },
-      failover: { type: 'boolean', description: '可选：主上游失败后是否自动换另一条上游再问一次（默认开）。只有没显式指定 provider 时才生效；显式指定 provider 视为钉死，传 true 可强制打开。本机执行器故障、缺环境变量、内容被策略拦截这三种情况不会切换（换后端只会同样失败，或等于绕过策略）。' },
+      failover: { type: 'boolean', description: '可选：是否允许换后端（默认开）。不指定 provider 时控制整条链；显式指定 provider 时视为钉死，传 true 才补一条备用。本机执行器故障、缺环境变量、内容被策略拦截这三种情况不会切换（换后端只会同样失败，或等于绕过策略）。' },
       deadlineMs: { type: 'integer', description: '可选：整次会审的总预算毫秒（含重试与切换），默认 timeoutMs×2，夹在 60000~900000。到点就收手，不会把多次单次超时累加成总时长。三条实际限制要知道：(1) 后面还有备用后端时，每次给主端算超时会先扣掉 90000ms 预留，否则主端两次慢失败就能把预算吃干、备用一次都起不来；注意这是「扣给后面」，不保证备用真能拿到 90000ms —— 主端第一次仍可能占满 timeoutMs，预留只在后续每次计算时才生效，且还要再被下面两条继续压缩；(2) 备用 aisz 单次最多 120000ms（即使你给的 timeoutMs 和剩余预算更大）；(3) 剩余预算不足 18000ms 时不会启动任何新尝试（其中 3000ms 是留给自己清理进程与写盘的）。预算挡下后续尝试时，返回里会有 stoppedBy=budget 与 budgetNote，此时 reason 只代表最后一次真正跑完的尝试。' },
       cwd: { type: 'string', description: '可选：让 Codex 以这个目录为工作目录（审某个项目时指向它；目录不存在则忽略）' },
       paths: {

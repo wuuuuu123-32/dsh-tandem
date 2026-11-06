@@ -2,8 +2,12 @@
 // 用 cmd.exe 当「假 codex」：它见到 exec 这种参数只会报错退出 1，几百毫秒就结束 ——
 // 失败快，才能在几秒内把「主端两败 + 备用也败」这类组合全跑完（真上游一次要 20 到 50 秒）。
 import { runConsult } from '../lib/consult.js';
+import fs from 'node:fs';
 
 const stateDir = 'C:/Users/123/.dsh/tandem-state/_failover-edge';
+// ❗每轮都从干净状态开始：v0.7.0 起会审链路读 stateDir 里的认领锁，
+// 残留的 portdan-day-*.lock 会让「当天第二次」的链（tf 打头）混进断言。
+fs.rmSync(stateDir, { recursive: true, force: true });
 const cfg = {
   codexCommand: 'C:/Windows/System32/cmd.exe',
   model: 'gpt-6.1-sol',
@@ -17,6 +21,11 @@ const brief = (tag, r, expect) => {
   const log = (r.attemptsLog || []).map(a => ({ p: a.provider, ok: a.ok, r: a.reason }));
   const got = { ok: r.ok, reason: r.reason, failoverFrom: r.failoverFrom, attempts: r.attempts, stoppedBy: r.stoppedBy, log };
   const bad = [];
+  // e4：attempts 必须等于「真的启动过进程」的条数 —— notStarted 的不算，且不许两者对不上。
+  const started = (r.attemptsLog || []).filter(a => a.started !== false).length;
+  if (!(r.attemptsLog || []).some(a => a.started === false) && got.attempts !== started) {
+    bad.push('attempts(' + got.attempts + ') 与真正启动的条数(' + started + ') 不一致');
+  }
   if (expect.attempts !== undefined && got.attempts !== expect.attempts) bad.push('attempts 应为 ' + expect.attempts);
   if (expect.failoverFrom !== undefined && (got.failoverFrom || null) !== expect.failoverFrom) bad.push('failoverFrom 应为 ' + String(expect.failoverFrom));
   if (expect.ok !== undefined && got.ok !== expect.ok) bad.push('ok 应为 ' + expect.ok);
@@ -26,8 +35,8 @@ const brief = (tag, r, expect) => {
 
 const out = [];
 try {
-  // E1：默认（不指定 provider、failover 默认开）→ 主端两次 + 备用一次，且要记下让位者
-  out.push(brief('E1_default_three_attempts', await runConsult({ mode: 'review', question: Q, config: cfg }), { attempts: 3, failoverFrom: 'portdan', ok: false }));
+  // E1：默认（不指定 provider、failover 默认开）→ 当天首次那条链：portdan 两次 + tokenfuture 两次 + aisz 一次
+  out.push(brief('E1_default_chain', await runConsult({ mode: 'review', question: Q, config: cfg }), { attempts: 5, failoverFrom: 'portdan', ok: false }));
   // E2：failover:false → 不许碰备用
   out.push(brief('E2_failover_off', await runConsult({ mode: 'review', question: Q, config: cfg, failover: false }), { attempts: 2, failoverFrom: null, ok: false }));
   // E3：显式 provider 视为钉死
