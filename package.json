@@ -15,7 +15,7 @@
     "acceptance"
   ],
   "scripts": {
-    "test": "node test/completion-marker.mjs && node test/consult-classify.mjs && node test/acceptance.mjs && node test/reviews.mjs && node test/register-smoke.mjs && node test/guard.test.mjs && node test/rescue.test.mjs && node test/failover-edge.mjs && node test/consult-chain.mjs && node test/chain-state.mjs && node test/smoke-verdict.mjs && node test/smoke-declared.mjs && node test/smoke-decide.mjs && node test/smoke-conflict.mjs && node test/smoke-cover.mjs && node test/smoke-fresh.mjs && node test/smoke-difftarget.mjs && node test/smoke-secret.mjs && node test/smoke-deny.mjs && node test/smoke-sep.mjs && node test/smoke-fence.mjs && node test/smoke-fence-len.mjs && node test/smoke-repair.mjs && node test/smoke-state.mjs",
+    "test": "node test/completion-marker.mjs && node test/consult-classify.mjs && node test/acceptance.mjs && node test/reviews.mjs && node test/register-smoke.mjs && node test/guard.test.mjs && node test/rescue.test.mjs && node test/failover-edge.mjs && node test/consult-chain.mjs && node test/chain-state.mjs && node test/smoke-verdict.mjs && node test/smoke-declared.mjs && node test/smoke-decide.mjs && node test/smoke-conflict.mjs && node test/smoke-cover.mjs && node test/smoke-fresh.mjs && node test/smoke-difftarget.mjs && node test/smoke-secret.mjs && node test/smoke-deny.mjs && node test/smoke-sep.mjs && node test/smoke-fence.mjs && node test/smoke-fence-len.mjs && node test/smoke-repair.mjs && node test/smoke-coverage.mjs && node test/smoke-state.mjs && node test/smoke-budget.mjs",
     "test:live": "node test/smoke-parallel.mjs && node test/smoke-live.mjs"
   },
   "files": [

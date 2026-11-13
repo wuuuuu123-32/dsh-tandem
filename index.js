@@ -21,6 +21,7 @@ import { normalizeChecks, checksHash, runChecks, buildGapReport } from './lib/ac
 import { loadTickets, saveTickets, getTicket, recordCheck, normalizeDir } from './lib/tickets.js';
 import { findReview, reviewCovers, fingerprintPaths } from './lib/reviews.js';
 import { createLedger } from './lib/ledger.js';
+import { claimRound, recordRound, taskKeyFor, DEFAULT_MAX_ROUNDS } from './lib/budget.js';
 import { createRescue } from './lib/rescue.js';
 import { randomUUID } from 'node:crypto';
 import { ensureEnv, credentialsPath } from './lib/env.js';
@@ -101,6 +102,10 @@ const DEFAULTS = {
   maxParallel: 3,
   workRoots: ['D:/dsh/work'],
   taskTimeoutMs: 300000,
+  // ❗会审轮次上限（2026-11-13 用户要求写进机制）：同一个任务（按 paths 集合认身份）
+  // 24 小时内最多问几轮。默认 2 —— 第 3 轮直接拒绝，要越过必须显式 forceRound。
+  // 这个数字来自一次事故：我自己在同一件事上连问 9 轮，用户在旁边等了 50 分钟。
+  consultMaxRounds: 2,
   // Codex 退出码 0 时还要看日志里有没有 "tokens used" 完成标记，没有就判空跑并重派。
   // 换 Codex 版本后若这个标记消失，设成 false 关掉（只是少一层保护，不影响派活）。
   requireCompletionMarker: true,
@@ -412,6 +417,7 @@ export function apply(ctx, pluginConfig = {}) {
       judges: { type: 'array', items: { type: 'string' }, description: '可选：并行会审的 judge 列表（默认 ["portdan","quna-sonnet"] 即跨厂商双跑）。每位 judge 独立回答、互不拖累：顶层 ok = 至少一条成功，失败的列在 failed 里且不能当成「没意见」。若 judge 之间结论方向相反会列进 conflicts，此时不签发 reviewId。注意 quna-sonnet 与 quna-opus 同属一家厂商，同时选两个不构成跨厂商独立意见（返回里 vendors 会显示实际厂商数）。传 [] 或只传一个则退化为单路。' },
       material: { type: 'array', items: { type: 'string' }, description: '可选：把指定文件的真实内容贴进 prompt（相对 cwd 或绝对路径）。只读、不修改。安全边界：必须在 cwd / workRoots 之内（realpath 后校验，挡符号链接逃逸）、拒绝 .env / .credentials.yaml / *.pem / *.key / id_rsa 等凭据文件、拒绝 .git / node_modules / .ssh 目录、单文件 60KB、总量 200KB 封顶（超了截断并标注）。被拒的文件会列进返回的 materialRejected，不会静默跳过。' },
       dual: { type: 'boolean', description: '可选：同时问遍布两条上游，两份回答都返回，用来对照两家的失败率、速度与判断差异。开了它就忽略 provider。' },
+      forceRound: { type: 'boolean', description: '可选：越过「同一任务最多 2 轮会审」的上限。默认不要传 —— 上限是机制（<stateDir>/consult-budget.json 按 paths 集合计数，24 小时窗口），用满之后工具会直接拒绝并要求把结果交回给人决定。只有在用户明确说「再问一轮」时才传 true，且被越过的那一轮同样记进历史。' },
       timeoutMs: { type: 'integer', description: '单次尝试的超时毫秒；默认 180000，夹在 30000~300000' },
       failover: { type: 'boolean', description: '可选：是否允许换后端（默认开）。不指定 provider 时控制整条链；显式指定 provider 时视为钉死，传 true 才补一条备用。本机执行器故障、缺环境变量、内容被策略拦截这三种情况不会切换（换后端只会同样失败，或等于绕过策略）。' },
       deadlineMs: { type: 'integer', description: '可选：整次会审的总预算毫秒（含重试与切换），默认 timeoutMs×2，夹在 60000~900000。到点就收手，不会把多次单次超时累加成总时长。三条实际限制要知道：(1) 后面还有备用后端时，每次给主端算超时会先扣掉 90000ms 预留，否则主端两次慢失败就能把预算吃干、备用一次都起不来；注意这是「扣给后面」，不保证备用真能拿到 90000ms —— 主端第一次仍可能占满 timeoutMs，预留只在后续每次计算时才生效，且还要再被下面两条继续压缩；(2) 备用 aisz 单次最多 120000ms（即使你给的 timeoutMs 和剩余预算更大）；(3) 剩余预算不足 18000ms 时不会启动任何新尝试（其中 3000ms 是留给自己清理进程与写盘的）。预算挡下后续尝试时，返回里会有 stoppedBy=budget 与 budgetNote，此时 reason 只代表最后一次真正跑完的尝试。' },
@@ -462,6 +468,18 @@ export function apply(ctx, pluginConfig = {}) {
           reviewId: { type: 'string', description: '会审通过时签发的标记；派活时带给 tandem_delegate，验收结果里就能看到「这部分审过」。签发条件是四条同时成立：有 paths、全部 judge 成功、无冲突、**没有任何一家否决**且至少一家读得出通过。不满足时**不返回这个键**，原因在 reviewNote 里' },
           reviewedPaths: { type: 'array', items: { type: 'string' }, description: '这个标记覆盖的路径' },
           reviewNote: { type: 'string', description: '关于凭证的说明：没签发时给出原因（未指定 paths / 有 judge 失败 / 有冲突 / 有否决 / 结论读不出 / 文件在会审期间被改），签发时说明覆盖范围' },
+          budget: {
+            type: 'object',
+            description: '会审轮次预算：同一任务（按 paths 集合认身份，24 小时窗口）默认最多 2 轮，用满后工具直接拒绝并返回 error。key 是任务标识，used 是**这一轮之前**已用轮数，remaining 是还剩几轮',
+            additionalProperties: false,
+            properties: {
+              key: { type: 'string', required: true },
+              round: { type: 'integer', required: true },
+              used: { type: 'integer', required: true },
+              maxRounds: { type: 'integer', required: true },
+              remaining: { type: 'integer', required: true },
+            },
+          },
           judges: { type: 'array', items: { type: 'string' }, description: '并行模式（传了 judges）时才有：这次实际问了哪几家' },
           vendors: { type: 'integer', description: '并行模式：**成功**的 judge 覆盖了几家厂商（按 vendor 去重）。< 2 说明没构成跨厂商独立意见' },
           verdicts: {
@@ -763,6 +781,29 @@ export function apply(ctx, pluginConfig = {}) {
         && typeof args?.failover !== 'boolean'
         && !(Array.isArray(args?.judges) && args.judges.length === 0)
         && !(judgesGiven && args.judges.length === 1);
+
+      // ❗会审轮次上限：机制，不是记忆（2026-11-13 用户要求，原话「这个会审轮次限制要加入
+      // 插件的机制管控里面，不能考某一次对话记住」）。
+      // 为什么放这里而不是放进 runConsult：轮次是「同一件事问了几次」的问题，
+      // 只有这一层同时看得见 paths（任务身份）与 config（上限），也才拦得住
+      // 单路 / 双跑 / dual 三条分支。
+      // 计数落在 <stateDir>/consult-budget.json，按 paths 集合算任务键，24 小时窗口。
+      const budgetKey = taskKeyFor({ paths: Array.isArray(args?.paths) ? args.paths.map(String) : [], question });
+      const maxRounds = Number(cfg.consultMaxRounds) > 0 ? Number(cfg.consultMaxRounds) : DEFAULT_MAX_ROUNDS;
+      const budget = claimRound(cfg.stateDir, budgetKey, { maxRounds, force: args?.forceRound === true });
+      if (!budget.allowed) {
+        return {
+          ok: false,
+          mode,
+          ms: 0,
+          error: '这个任务已经用满 ' + budget.maxRounds + ' 轮会审，机制拦下了第 ' + (budget.used + 1) + ' 轮。' + budget.historyText
+            + '处理办法：①把这几轮的意见消化完，按失败项改代码，改完由人决定要不要再问；'
+            + '②确实需要再问一轮时，由用户明确同意后传 forceRound: true（这一轮同样记进历史）；'
+            + '③换一个任务身份（不同 paths）会重新计数 —— 但那是另一件事，不是绕过。',
+          budget: { key: budgetKey, used: budget.used, maxRounds: budget.maxRounds, historyText: budget.historyText },
+        };
+      }
+
       if (wantParallel) {
         const par = await runConsultParallel({
           ...baseArgs,
@@ -776,9 +817,11 @@ export function apply(ctx, pluginConfig = {}) {
           // 签发前用它核对「注入的字节」与「此刻磁盘上的字节」（第 16 轮会审 portdan）。
           materialItems,
         });
+        recordRound(cfg.stateDir, budgetKey, { ok: par.ok, verdicts: par.verdicts || [], reviewId: par.reviewId, ms: par.ms });
         return {
           ...par,
           mode,
+          budget: { key: budgetKey, round: budget.round, used: budget.used + 1, maxRounds: budget.maxRounds, remaining: budget.remaining },
           ...(materialRejected.length ? { materialRejected } : {}),
           ...(materialStats ? { materialStats } : {}),
         };
@@ -825,10 +868,12 @@ export function apply(ctx, pluginConfig = {}) {
           };
         });
         const bothOk = dual.every(d => d && d.ok);
+        recordRound(cfg.stateDir, budgetKey, { ok: dual.some(d => d && d.ok), ms: Math.max(0, ...dual.map(d => d.ms)) });
         return {
           ok: bothOk,
           mode,
           ms: Math.max(0, ...dual.map(d => d.ms)),
+          budget: { key: budgetKey, round: budget.round, used: budget.used + 1, maxRounds: budget.maxRounds, remaining: budget.remaining },
           note: (bothOk ? 'dual 模式：两份回答都在 dual 里，逐条对照后再下判断；'
               : 'dual 模式但有上游失败（看各条的 reason/hint）；failed 的那条不能当成「没意见」；')
             + 'dual 下已忽略 provider 入参，也不签发 reviewId（两份独立意见不等于覆盖了某段改动）',
@@ -861,11 +906,18 @@ export function apply(ctx, pluginConfig = {}) {
         materialItems,
       });
       const answer = res.answer || {};
+      recordRound(cfg.stateDir, budgetKey, {
+        ok: res.ok,
+        verdicts: res.verdicts || (res.verdict ? [res.verdict] : []),
+        reviewId: res.reviewId,
+        ms: res.ms,
+      });
       // 不用 undefined 占位：快照要求无损 JSON，缺键比 undefined 安全。
       return {
         ok: res.ok,
         mode,
         ms: res.ms,
+        budget: { key: budgetKey, round: budget.round, used: budget.used + 1, maxRounds: budget.maxRounds, remaining: budget.remaining },
         ...(res.provider === undefined ? {} : { provider: res.provider }),
         ...(answer.conclusion === undefined ? {} : { conclusion: answer.conclusion }),
         ...(answer.evidence === undefined ? {} : { evidence: answer.evidence }),

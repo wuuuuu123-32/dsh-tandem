@@ -37,6 +37,14 @@ const fromText = [
   ['不准上线', 'fail'],
   ['不予放行', 'fail'],
   ['不得直接合并', 'fail'],
+  // ❗第 10 轮 portdan 的构造：首句 mixed（同时命中正反）、次句明确否决，
+  // 原来「先判 mixed 返回 unclear」把次句的否决吃掉了，声明 pass 于是生效。
+  ['有问题但可以接受。不能直接用。', 'fail'],
+  ['有问题但可以接受。这段不能上线。', 'fail'],
+  // 祈使式否决
+  ['请勿合并', 'fail'],
+  ['别合并这块', 'fail'],
+  ['禁止提交', 'fail'],
   ['不通过', 'fail'],
   ['驳回', 'fail'],
   ['需要大改', 'fail'],
@@ -45,6 +53,11 @@ const fromText = [
   ['I would not approve this', 'fail'],
   ['This does not look good', 'fail'],
   ['Not LGTM', 'fail'],
+  ['I recommend against merging this.', 'fail'],
+  ['This should not be merged.', 'fail'],
+  ['It must not be shipped', 'fail'],
+  ['We advise against shipping', 'fail'],
+  ['I do not recommend this', 'fail'],
   ['有问题但可以接受', 'unclear'],
   ['信息不足，需要更多上下文', 'unclear'],
   ['', 'unclear'],
@@ -74,6 +87,10 @@ const declared = [
   ['不能直接用', 'pass', 'fail'],
   ['I would not approve this', 'pass', 'fail'],
   ['当前版本不可用，修好后可以上线', 'pass', 'fail'],
+  ['I recommend against merging this.', 'pass', 'fail'],
+  // 声明 unclear 但正文明确否决 → 仍算否决（第 24 轮会审给的构造：一家 pass + 一家这么写就签发了）
+  ['不通过，必须修改后才能合并', 'unclear', 'fail'],
+  ['This must not be merged.', 'unclear', 'fail'],
   // 声明 unclear 直接采纳
   ['可以直接用', 'unclear', 'unclear'],
   // 中文同义词
