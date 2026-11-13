@@ -1,5 +1,56 @@
 # 变更记录
 
+## 0.8.0 — 2026-11-13
+
+### 会审从「问一条链」变成「问几家 + 给它看真材料」，凭证判据重做
+
+用户的原话分三次给：「可以先再跑5次会审看看，三个都上。然后多给材料确实可以，改一下插件吧（这个改动的会审也作为测试让三个模型跑）」「加入用来会审的话，价格是不是可以接受的」「我们tandem目前日常就用portdan的gpt6.1sol和这里的claude sonnet 5.5就行」。第三句定了默认组合。
+
+**一、默认跨厂商双跑。** `DEFAULT_JUDGES = ['portdan', 'quna-sonnet']`，前者 gpt-6.1-sol（vendor `openai`），后者 claude-sonnet-5-5（vendor `anthropic`）。新增 `judges` 参数；与 `provider` / `dual` / `failover` 同传**直接报错**而不是静默选一个——被问的那一家不能在我们看不见的地方被换掉，而会审的价值全在问的是谁。
+
+`quna-sonnet` 与 `quna-opus` 虽然共用同一个中转站，`vendorCount` 会如实算成 1 家；同时选它们不构成跨厂商独立意见，note 里会写出来。
+
+**二、材料注入。** 旧的 `paths` 只用于签凭证，内容从不进 prompt，于是会出现「凭证说覆盖了 config.js，而 judge 只看到调用方复述的片段」——凭证比证据强，这是 10 月两次事故的共同病根。现在 `material` 显式指定、`paths` 里的文件默认注入（`materialStats.auto`），并且：
+
+| 项 | 值 |
+|---|---|
+| 单文件 | 60 KB，超出截断且**截断不算覆盖** |
+| 总量 / 文件数 | 200 KB / 40 个 |
+| 白名单 | 只认 `workRoots`；**没配时 cwd 也不许当根**（原来没配等于全放开，传 `cwd: "C:/Users/me"` 整棵主目录都能读） |
+| 禁止目录 | `.git / node_modules / .ssh / .aws / .docker / .kube / .gnupg`，按路径段判，覆盖 `GIT~1` 这类 8.3 短名 |
+| 凭据 | `.env*`、`credentials*`、`*.pem/key/p12/p8/ppk/jks/tfstate/kubeconfig`、`service-account*.json`、`id_ed25519` 等一长串；Windows 的结尾点（`key.pem.`）、8.3 短名（`ENV~1`）、NTFS 命名流（`notes.txt:secret`）都挡，但放行 `README.md:Zone.Identifier`（浏览器下载标记） |
+| 硬链接 / 竞态 | `nlink > 1` 拒；`open` 后 `fstat` 比对 `dev/ino/size`，不一致就拒 |
+
+围栏长度自适应：内容里出现连续 4 个以上反引号时，包裹围栏比它更长，否则被注入的内容能提前闭合围栏、把自己抬成指令。
+
+**三、凭证判据从「有没有意见」改成「能不能背书」。** 旧条件只有「全部成功 + 无冲突 + 有 paths」，实测立刻露馅：两位 judge 都说「存在严重缺陷，必须修改」时冲突数为 0，凭证照发，而 `tandem_delegate` 会显示成「这部分审过」。
+
+判据收敛成纯函数 `decideReview(...)`，八条：没 paths / 有失败或数量不符 / 有未知 verdict 值 / 有冲突 / 有否决 / **没有任何一家判 pass** / 多路须 `vendors >= 2` / 材料未覆盖或指纹未知或在会审期间变化。第 6、7 条只对多路生效，否则既有单路调用永远签不出凭证，闸门变成死锁。
+
+**判「通过/否决」以声明为准，正则只能否决不能放行。** judge 的 JSON 多一个 `verdict: pass|fail|unclear`；没有声明时，正则最多读出 fail 或 unclear，**永远读不出 pass**。这条最值钱：一张凭证背后的「通过」一定是模型显式写的，不是从散文里猜的。原因是补词循环根本收敛不了——第 3、5、6、8、9、10 轮，每轮都能找出一句新说法绕过词表（「当前版本不可用，修好后可以上线」「I would not approve this」「说它可以直接用是错误的」）。
+
+签发失败时 note 说明是哪一条拦的；成功时写明「已签发：A=pass、B=unclear，1 家厂商」——乙语义下 unclear 不挡路，但也不背书。
+
+**四、这套判据被自己审了 12 轮。** 第 1 轮就推翻了一个未验证前提：portdan 说 Codex 不接受 `wire_api=chat` 会失败、并建议写 Chat 适配器；实测报错 `wire_api = "chat" is no longer supported`，而 qunaapi 其实**有** `/v1/responses` 端点——不需要适配器，provider 表加一条即可。之后逐轮被挑出真路径并修掉：零位 judge 也签发、`judges: []` 过滤成空数组、claude 系习惯套 ```json 围栏、opus 在 JSON 里照抄正则导致 `Bad escaped character`、没有声明时正则给出 pass、非字符串 verdict 被 `typeof` 丢掉导致 bogus 闸门失效、单路指纹取三次的竞态（外部进程正好在两次读之间写文件，凭证会记下 judge 没看过的新版本指纹）。
+
+**五、会审材料从「全量 diff」改成「要审那段的最新源码切片」。** 全量 diff 是 104 KB ≈ 2.8 万 token，其中大半是 `-U3` 的上下文行，对判逻辑没用；完整源码反而更小，因为不含重复上下文。判据段 335 行约 1.3 万字节。顺带解决两件事：claude 那个组对十万字节的请求直接报 high demand；一家扫 3 万 token 只会挑最刺眼的，范围缩小反而答得准。凭证的 `paths` 指向切片文件本身而不是源文件——凭证说的就是「这三个切片被审过」，与事实一致，不冒充整个文件。
+
+**六、测试。** 12 份纯离线冒烟进 `npm test`（判据词表 31 条、单向闸门 15 条、`decideReview` 21 条、材料覆盖 7 条、凭据黑名单 25 种名字加 Windows 三种变形、围栏 5 条、分隔符 5 条、状态并发 5 条、JSON 修复 7 条、冲突 9 条）；会真起 Codex 的两份挪到 `npm run test:live`。
+
+**七、发布前会审的第 15、16 轮又挑出三条真路径，都修了。**
+
+到第 14 轮时两位 judge 都判「不能发」，其中两条是硬的：
+
+- **diff 覆盖不验证内容**：`diffTargets` 只认 diff 头与 hunk，从不核对这份 diff 是否真的对应目标文件的当前内容。于是旧 diff、或者随手编的（`+++ b/src/critical.js` 加一个 `@@`）都能替一份 judge 从没见过的文件作证。现在每份像 diff 的材料都跑 `git apply --check --reverse`（先规范化 CRLF，否则 Windows 写的补丁会被误判成伪造），只有通过才算覆盖。文件、伪造、过期、无 hunk、被截断、目录型六种情况都有冒烟对应用例。
+- **「注入了」不等于「注入的是那一版」**：`collectMaterials` 现在对自己读入的那段字节算 sha1，签发前 `checkMaterialFreshness` 重读文件比对 sha **与长度**（只比 sha 的话，「在后面追加一段」察觉不到）。两条分支都传 `materialItems` 下去。
+- 另外两条较小的：目录型 `paths` 原来只要目录里任一文件进材料就算覆盖——现在**一律不算**（凭证会声称整个目录被审过，那种凭证比没有更坏）；`isUnder(stateKey, rk)` 会把包住 stateDir 的 workRoot 整个剔除，导致 `matRoots` 变空、一切材料被判越界——改成把 stateDir 当**拒绝根**传下去，只拦它自己下面的文件。
+
+还有一条被判「不成立」而我保留意见的：portdan 说新增 provider 没展示 `wire_api`。`lib/consult.js` 里本来就有 `model_providers.<p>.wire_api=responses`（不加会被 Codex 0.163 直接拒绝），而那一轮会审本身就是经 Codex→quna 跑通的。
+
+**已接受的残留局限**（不是漏审，是取舍）：乙语义下一家 pass 加一家 unclear 会签发；不给 `verdict` 字段的回答只能表达否决或沉默；单路凭证弱一档；基于文件名的黑名单追不上「把 .env 改名成 notes.txt」这种蓄意伪装——材料注入是给人用的工具，不是对抗有敌意的调用方，后者需要沙箱。
+
+---
+
 ## 0.7.0 — 2026-11-07
 
 ### 会审后端改成「当天首次 portdan、其余优先免费额度」的链路

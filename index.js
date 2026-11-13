@@ -12,11 +12,11 @@
  *  - 不在这里做 PreToolUse 阻断。参数校验已经天然强制，hook 只该拦不可逆操作，
  *    否则 agent 被拦后会改写命令重试，形成死循环。
  */
-import { existsSync, readFileSync, appendFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, appendFileSync, mkdirSync, realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { validateTasks, normalizeRoots, runTasks, summarize, runOne, insideRoots } from './lib/delegate.js';
-import { runConsult, readLastConsult, MODES, CONSULT_PROVIDERS, readProviderState, localDay, tfCoolingDown } from './lib/consult.js';
+import { runConsult, runConsultParallel, readLastConsult, MODES, CONSULT_PROVIDERS, DEFAULT_JUDGES, vendorCount, collectMaterials, renderMaterials, checkMaterialCoverage, readProviderState, localDay, tfCoolingDown } from './lib/consult.js';
 import { normalizeChecks, checksHash, runChecks, buildGapReport } from './lib/acceptance.js';
 import { loadTickets, saveTickets, getTicket, recordCheck, normalizeDir } from './lib/tickets.js';
 import { findReview, reviewCovers, fingerprintPaths } from './lib/reviews.js';
@@ -408,7 +408,9 @@ export function apply(ctx, pluginConfig = {}) {
       question: { type: 'string', required: true, description: '要判断的问题本身，需自包含（Codex 看不到本对话）' },
       context: { type: 'string', description: '材料：需求原文、diff 摘要、测试结果、来源摘录' },
       options: { type: 'array', items: { type: 'string' }, description: 'mode=compare 时的候选方案（每条一句话）' },
-      provider: { type: 'string', enum: ['portdan', 'tokenfuture', 'aisz'], description: '可选：钉死某条上游。portdan / tokenfuture 都是 gpt-6.1-sol，aisz 是 gpt-6.1-terra。不填就走链：当天第一次 portdan → tokenfuture → aisz，之后 tokenfuture → portdan → aisz（tf 报没余额后 24 小时内跳过它）。填了视为钉死，只问这一条。' },
+      provider: { type: 'string', enum: ['portdan', 'tokenfuture', 'aisz', 'quna-sonnet', 'quna-opus'], description: '可选：钉死某条上游。portdan / tokenfuture 都是 gpt-6.1-sol，aisz 是 gpt-6.1-terra，quna-sonnet 是 claude-sonnet-5-5，quna-opus 是 claude-opus-5-5。不填就走链：当天第一次 portdan → tokenfuture → aisz，之后 tokenfuture → portdan → aisz（tf 报没余额后 24 小时内跳过它）。填了视为钉死，只问这一条。' },
+      judges: { type: 'array', items: { type: 'string' }, description: '可选：并行会审的 judge 列表（默认 ["portdan","quna-sonnet"] 即跨厂商双跑）。每位 judge 独立回答、互不拖累：顶层 ok = 至少一条成功，失败的列在 failed 里且不能当成「没意见」。若 judge 之间结论方向相反会列进 conflicts，此时不签发 reviewId。注意 quna-sonnet 与 quna-opus 同属一家厂商，同时选两个不构成跨厂商独立意见（返回里 vendors 会显示实际厂商数）。传 [] 或只传一个则退化为单路。' },
+      material: { type: 'array', items: { type: 'string' }, description: '可选：把指定文件的真实内容贴进 prompt（相对 cwd 或绝对路径）。只读、不修改。安全边界：必须在 cwd / workRoots 之内（realpath 后校验，挡符号链接逃逸）、拒绝 .env / .credentials.yaml / *.pem / *.key / id_rsa 等凭据文件、拒绝 .git / node_modules / .ssh 目录、单文件 60KB、总量 200KB 封顶（超了截断并标注）。被拒的文件会列进返回的 materialRejected，不会静默跳过。' },
       dual: { type: 'boolean', description: '可选：同时问遍布两条上游，两份回答都返回，用来对照两家的失败率、速度与判断差异。开了它就忽略 provider。' },
       timeoutMs: { type: 'integer', description: '单次尝试的超时毫秒；默认 180000，夹在 30000~300000' },
       failover: { type: 'boolean', description: '可选：是否允许换后端（默认开）。不指定 provider 时控制整条链；显式指定 provider 时视为钉死，传 true 才补一条备用。本机执行器故障、缺环境变量、内容被策略拦截这三种情况不会切换（换后端只会同样失败，或等于绕过策略）。' },
@@ -457,9 +459,106 @@ export function apply(ctx, pluginConfig = {}) {
           history: { type: 'string' },
           log: { type: 'string' },
           tail: { type: 'string' },
-          reviewId: { type: 'string', description: '会审通过时签发的标记；派活时带给 tandem_delegate，验收结果里就能看到「这部分审过」' },
+          reviewId: { type: 'string', description: '会审通过时签发的标记；派活时带给 tandem_delegate，验收结果里就能看到「这部分审过」。签发条件是四条同时成立：有 paths、全部 judge 成功、无冲突、**没有任何一家否决**且至少一家读得出通过。不满足时**不返回这个键**，原因在 reviewNote 里' },
           reviewedPaths: { type: 'array', items: { type: 'string' }, description: '这个标记覆盖的路径' },
-          reviewNote: { type: 'string', description: '没签发标记时的说明（例如未指定 paths）' },
+          reviewNote: { type: 'string', description: '关于凭证的说明：没签发时给出原因（未指定 paths / 有 judge 失败 / 有冲突 / 有否决 / 结论读不出 / 文件在会审期间被改），签发时说明覆盖范围' },
+          judges: { type: 'array', items: { type: 'string' }, description: '并行模式（传了 judges）时才有：这次实际问了哪几家' },
+          vendors: { type: 'integer', description: '并行模式：**成功**的 judge 覆盖了几家厂商（按 vendor 去重）。< 2 说明没构成跨厂商独立意见' },
+          verdicts: {
+            type: 'array',
+            description: '并行模式：逐家把 conclusion 读成 pass / fail / unclear。凭证签发看它，不只看有没有冲突',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                judge: { type: 'string', required: true },
+                verdict: { type: 'string', enum: ['pass', 'fail', 'unclear'], required: true },
+                // ❗vendor / declaredRaw 必须声明（第 18 轮会审 portdan 指出）：
+                // 运行时确实会返回它们，而这里是 additionalProperties:false ——
+                // 宿主若照 schema 校验，正常双跑都会被判违规。
+                vendor: { type: 'string' },
+                declaredRaw: { description: 'judge 原始声明的值（可能是非字符串，比如数组或数字）—— 未知值靠它拦' },
+                source: {
+                  type: 'string',
+                  enum: ['declared', 'regex'],
+                  description: '这个判断来自哪：declared = judge 自己在 JSON verdict 字段里声明；regex = 从 conclusion 文本读出的兜底（可信度低一档）',
+                },
+              },
+            },
+          },
+          partial: { type: 'boolean', description: '并行模式：true = 有 judge 失败但至少一条成功。失败的那条不能当成「没意见」' },
+          results: {
+            type: 'array',
+            description: '并行模式：每位 judge 的完整回答，顺序与 judges 一致',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                judge: { type: 'string', required: true },
+                vendor: { type: 'string' },
+                model: { type: 'string' },
+                ok: { type: 'boolean', required: true },
+                ms: { type: 'integer', required: true },
+                verdict: { type: 'string', enum: ['pass', 'fail', 'unclear'], description: '这位 judge 声明的方向（归一后；缺字段说明它没按格式回答）' },
+                declaredRaw: { description: 'judge 原始声明的值。非字符串（数组/数字/对象）原样保留在这里，未知值闸门靠它判' },
+                conclusion: { type: 'string' },
+                evidence: { type: 'array', items: { type: 'string' } },
+                counterexamples: { type: 'array', items: { type: 'string' } },
+                verification: { type: 'string' },
+                reason: { type: 'string' },
+                hint: { type: 'string' },
+                failoverFrom: { type: 'string' },
+                log: { type: 'string' },
+                stack: { type: 'string', description: '抛异常时的调用栈（截断到 1500 字），用于定位是哪一步炸的' },
+                attemptsLog: {
+                  type: 'array',
+                  description: '这一路内部的尝试记录（换后端 / 重试各占一条）',
+                  items: { type: 'object', additionalProperties: true },
+                },
+                repaired: { type: 'array', items: { type: 'string' }, description: '格式修复记录：例如 ["escapes"] 表示靠修非法转义才解析成功（真实格式质量低于表面）' },
+              },
+            },
+          },
+          failed: {
+            type: 'array',
+            description: '并行模式：没给出有效回答的 judge（这些不能当成「没意见」）',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                judge: { type: 'string', required: true },
+                reason: { type: 'string', required: true },
+                ms: { type: 'integer', required: true },
+                hint: { type: 'string', description: '该怎么办（重试 / 缩材料 / 改配置）' },
+                log: { type: 'string', description: '这次尝试的日志路径：失败原因的真身在里面' },
+              },
+            },
+          },
+          conflicts: { type: 'array', items: { type: 'string' }, description: '并行模式：judge 之间结论方向相反的地方。有冲突时不签发 reviewId —— 冲突不等于通过' },
+          materialRejected: {
+            type: 'array',
+            description: 'material 里被拒绝的文件及原因（越界 / 凭据 / 超限），不会静默跳过',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                path: { type: 'string', required: true },
+                reason: { type: 'string', required: true },
+              },
+            },
+          },
+          materialStats: {
+            type: 'object',
+            additionalProperties: false,
+            description: 'material 实际注入情况',
+            properties: {
+              files: { type: 'integer', required: true },
+              bytes: { type: 'integer', required: true },
+              truncated: { type: 'array', items: { type: 'string' }, required: true },
+              auto: { type: 'boolean', description: 'true = 没有单独传 material，自动把 paths 里的文件当材料注入了' },
+              coverage: { type: 'string', description: '覆盖核对结果的一句话说明（哪些 paths 靠什么方式进了 prompt）' },
+            },
+          },
           provider: { type: 'string', description: '这次实际用的上游（attemptsLog 里最后一次的那个）。不填 provider 时是 default = 本插件固定的 portdan（gpt-6.1-sol），不读 Codex 全局配置里的 model' },
           stoppedBy: { type: 'string', description: '为什么没跑完：值是 budget 表示总预算不足，后续重试或换后端被挡下了' },
           budgetNote: { type: 'string', description: '预算挡下后续尝试时的说明（此时 reason 只代表最后一次真正跑完的尝试）' },
@@ -519,6 +618,103 @@ export function apply(ctx, pluginConfig = {}) {
         return { ok: false, mode, ms: 0, error: 'provider 只支持 ' + Object.keys(CONSULT_PROVIDERS).join(' / ') + '，收到「' + providerName + '」' };
       }
       const timeoutMs = Math.min(Math.max(Number(args?.timeoutMs) || 180000, 30000), 300000);
+      // 材料注入：先按白名单读盘，再把渲染结果交给会审（读不到/越界的不注入，但要在返回里说明）。
+      let materialsText = '';
+      let materialRejected = [];
+      let materialStats;
+      let materialCoverage = null;
+      let materialItems = null;
+      let preFingerprint = null;
+      {
+        // ❗白名单根只能来自配置，**不能来自调用方入参**（2026-11-13 三路会审一致指出）：
+        // 原来 roots 直接用了 args.cwd —— 传 cwd='C:/Users/123' 就把整个主目录变成白名单，
+        // 只剩文件名黑名单兜底；而名为 denyRoot 的变量实际是把 stateDir **加进**允许根，
+        // stateDir 里躺着历史会审的 prompt.txt / consult.log（含别的项目的材料）。
+        // 现在的规则：roots = workRoots ∪ {cwd 仅当它本身落在 workRoots 之内}，stateDir 永不入白名单。
+        const workRoots = (Array.isArray(cfg.workRoots) ? cfg.workRoots : []).filter(Boolean).map(String);
+        const defaultBase = workRoots[0] || process.cwd();
+        const cwdRaw = args?.cwd ? String(args.cwd) : defaultBase;
+        let cwdForMat = defaultBase;
+        let cwdRejected = null;
+        // ❗workRoots 为空时**不放开** cwd（2026-11-13 会审 portdan 指出）：
+        // 原来的 `okCwd = !workRoots.length || ...` 意味着「没配白名单 = 哪里都能读」，
+        // 调用方传 cwd='C:/Users/123' 就能把整个主目录变成材料根，只剩文件名黑名单兜底。
+        // 现在没配白名单就只认 defaultBase（= process.cwd()），仍然要过 realpath 校验。
+        let okCwd = false;
+        try {
+          const realCwd = realpathSync(resolve(cwdRaw));
+          okCwd = workRoots.length
+            ? workRoots.some(r => {
+              let realRoot;
+              try { realRoot = realpathSync(resolve(r)); } catch { realRoot = resolve(r); }
+              const a = realCwd.toLowerCase().replace(/[\\/]+$/, '');
+              const b = String(realRoot).toLowerCase().replace(/[\\/]+$/, '');
+              return a === b || a.startsWith(b + '\\') || a.startsWith(b + '/');
+            })
+            : false;
+          if (okCwd) cwdForMat = realCwd;
+          else cwdRejected = {
+            path: String(args?.cwd || cwdRaw),
+            reason: workRoots.length
+              ? 'cwd 不在 workRoots 之内，拒绝作为材料白名单根'
+              : '未配置 workRoots，cwd 不可作为材料白名单根（请先在插件配置里配 workRoots）',
+          };
+        } catch { cwdRejected = { path: String(args?.cwd || cwdRaw), reason: 'cwd 无法解析，拒绝作为材料白名单根' }; }
+        const wantMat = Array.isArray(args?.material) ? args.material : [];
+        // ❗stateDir 里的历史会审 prompt.txt / consult.log 含**别的项目**的材料，
+        // 一旦 stateDir 恰好落在某个 workRoot 内，它就会顺带变成可读目录
+        //（第 6 轮会审 portdan 指出）。这里直接把「包含 stateDir 的那个 workRoot」整个剔掉 ——
+        // 宁可少读一个根，也不让历史会审记录变成下一次会审的材料。
+        // 正常配置下 stateDir 在 ~/.dsh 下、workRoots 在工作盘，这条永远不会命中。
+        const stateKey = String(cfg.stateDir || '').replace(/[\\/]+$/, '').toLowerCase();
+        const isUnder = (child, parent) => !!parent && (child === parent || child.startsWith(parent + '\\') || child.startsWith(parent + '/'));
+        // ❗根里只能有 workRoots，加上「已通过校验的 cwd」。原来无条件把 cwdForMat 加进来，
+        // 而 workRoots 为空时 cwdForMat 回落到 process.cwd()，于是「没配白名单」照样能把
+        // DSH 进程的工作目录变成材料根 —— 拒绝记录说拒了、实际还在用，两处不一致
+        //（第 14 轮会审 quna-sonnet 指出，这条它说对了）。
+        const matRoots = [okCwd ? cwdForMat : null, ...workRoots].filter(r => {
+          if (!r) return false;
+          const rk = String(r).replace(/[\\/]+$/, '').toLowerCase();
+          if (isUnder(rk, stateKey)) return false; // 根本身在 stateDir 里
+          // ❗不再剔除「把 stateDir 包住」的根（第 15 轮会审 quna-sonnet 指出这是误杀）：
+          // workRoots=['D:/projects'] 而 stateDir='D:/projects/.state' 时，原来会把整个
+          // D:/projects 剔掉 → matRoots 空 → 所有材料都判越界。改成把 stateDir 当**拒绝根**
+          // 传给 collectMaterials，只拦它自己下面的文件。
+          return true;
+        });
+        // ❗paths 里的文件**默认也当材料读进来**（2026-11-13 三路会审指出）：
+        // 原来 paths 只用于签凭证、内容从不进 prompt，于是「凭证说覆盖了 config.js，
+        // 而 judge 只看到调用方复述的片段」—— 这正是 10 月两次事故的病根，也是最讽刺的一种：
+        // 凭证比证据强。现在 paths 里的普通文件默认注入；调用方显式给了 material 时以它为准。
+        const want = wantMat.length ? wantMat : (Array.isArray(args?.paths) ? args.paths.map(String) : []);
+        if (want.length) {
+          const mats = collectMaterials(want, { roots: matRoots, base: cwdForMat, denyRoots: cfg.stateDir ? [cfg.stateDir] : [] });
+          materialsText = renderMaterials(mats);
+          materialRejected = [...(cwdRejected ? [cwdRejected] : []), ...mats.rejected];
+          // 签发前要用它核对「注入的字节」与「此刻磁盘上的字节」是否同一份（见 checkMaterialFreshness）。
+          materialItems = mats;
+          // 凭证要核对「paths 里的文件是不是真的进了 prompt」——这是三家一致指出的
+          // 最要害一条：原来 paths 只做记录，凭证能覆盖一份 judge 从未见过的文件。
+          materialCoverage = checkMaterialCoverage(Array.isArray(args?.paths) ? args.paths : [], mats);
+          // ❗指纹就在**读完材料之后**取，并一路传下去当「会审前的指纹」。
+          // 原来由 runConsult/runConsultParallel 在进入函数时才取，比起读材料晚了一步：
+          // 中间有人改了文件，凭证就会用改后的指纹替改前的内容作证
+          //（第 14 轮会审 portdan 指出）。取不到就让下游 fail-closed 拒签。
+          const coveredNow = Array.isArray(args?.paths) ? args.paths.map(String) : [];
+          if (coveredNow.length) {
+            try { preFingerprint = fingerprintPaths(coveredNow); } catch { preFingerprint = null; }
+          }
+          materialStats = {
+            files: mats.items.length,
+            bytes: mats.items.reduce((s, m) => s + (m.bytes || 0), 0),
+            truncated: mats.items.filter(m => m.truncated).map(m => m.path),
+            auto: !wantMat.length,
+            coverage: materialCoverage.detail,
+          };
+        } else if (cwdRejected) {
+          materialRejected = [cwdRejected];
+        }
+      }
       const baseArgs = {
         mode,
         question,
@@ -531,6 +727,62 @@ export function apply(ctx, pluginConfig = {}) {
         failover: typeof args?.failover === 'boolean' ? args.failover : null,
         deadlineMs: Math.min(Math.max(Number(args?.deadlineMs) || timeoutMs * 2, 60000), 900000),
       };
+      // 并行会审（方案 B，2026-11-13）：默认就走多路，跨厂商双跑。
+      // ❗三条「退回单路」的显式信号，缺一不可 —— 否则工具描述里写的「默认双跑」
+      // 与代码实际行为不符（会审 portdan 指出：不传 judges 时永远走单路，描述在骗人）：
+      //   ① 给了 provider        = 钉死问某一家；
+      //   ② dual:true            = 老的「全表双跑」，行为要保留；
+      //   ③ failover 传了布尔值   = 调用方明确在管「链式切换」这件事，别替他改语义。
+      // 传 judges: [] 也退回单路，是留给「我就要单路但不想写 provider」的出口。
+      // ❗judges 与 provider 同时给是自相矛盾的指令，必须当场拒绝而不是悄悄二选一：
+      // 静默降级会让人以为「并行问了两家」，实际只问了 provider 那一家。
+      // 同理 failover / dual 与 judges 同时给也要拒绝 —— 原来它们会把 judges 静默吃掉，
+      // 调用方以为问了两家、其实只走了一条链（三路会审都点了这条）。
+      const judgesGiven = Array.isArray(args?.judges) && args.judges.length > 0;
+      if (providerName && judgesGiven) {
+        return { ok: false, mode, ms: 0, error: 'judges 与 provider 不能同时传：judges 决定并行问哪几家，provider 决定钉死问哪一家' };
+      }
+      if (judgesGiven && args?.dual === true) {
+        return { ok: false, mode, ms: 0, error: 'judges 与 dual 不能同时传：dual 是「把 provider 表全跑一遍」的老行为，judges 是显式挑人，二者冲突' };
+      }
+      if (judgesGiven && typeof args?.failover === 'boolean') {
+        return { ok: false, mode, ms: 0, error: 'judges 与 failover 不能同时传：并行会审下「失败换后端」这件事由每个 judge 各自在内部处理，外层不用再指定' };
+      }
+      // 退化规则（与工具描述一致）：
+      //   · 不传 judges          → 默认双跑 DEFAULT_JUDGES（方案 B）
+      //   · judges 恰好一个       → 退化为单路（原描述如此承诺，原代码没做，会审 sonnet 指出）
+      //   · judges: []           → 也退化为单路（「我就要单路但不想写 provider」的出口）
+      //   · provider / dual:true → 各自的老行为
+      // ❗`judges: ['  ']` 也要拒绝（第 18 轮会审 portdan 指出）：`length === 1` 让它走单路，
+      // 而 trim 后 provider 是空串 → 静默落回默认 provider 链，问的那一家被换掉，成功还照签。
+      if (Array.isArray(args?.judges) && args.judges.length && !args.judges.some(x => String(x == null ? '' : x).trim())) {
+        return { ok: false, mode, ms: 0, error: 'judges 里全是空白项：要么给具体的 provider 名，要么整个别传（不传就走默认双跑）' };
+      }
+      const wantParallel = !providerName
+        && args?.dual !== true
+        && typeof args?.failover !== 'boolean'
+        && !(Array.isArray(args?.judges) && args.judges.length === 0)
+        && !(judgesGiven && args.judges.length === 1);
+      if (wantParallel) {
+        const par = await runConsultParallel({
+          ...baseArgs,
+          judges: Array.isArray(args?.judges) && args.judges.length ? args.judges : DEFAULT_JUDGES,
+          materials: materialsText,
+          // ❗必须透传：凭证签发要核对「paths 里的文件是不是真的进了 prompt」。
+          // 不透传就是 materialCoverage 缺失 → 多路永远签不出凭证（那会让闸门死锁）。
+          materialCoverage,
+          // ❗把「读完材料那一刻」的指纹带下去，别让下游自己重新取（第 14 轮会审 portdan）。
+          preFingerprint,
+          // 签发前用它核对「注入的字节」与「此刻磁盘上的字节」（第 16 轮会审 portdan）。
+          materialItems,
+        });
+        return {
+          ...par,
+          mode,
+          ...(materialRejected.length ? { materialRejected } : {}),
+          ...(materialStats ? { materialStats } : {}),
+        };
+      }
       // 双轨：同一问题同时送给两条上游。两边独立跑，谁先回来都不影响另一个。
       // 注意 dual 下不签发 reviewId —— 两份回答互相独立，无法声称「覆盖了某个 diff」。
       if (args?.dual === true) {
@@ -586,9 +838,27 @@ export function apply(ctx, pluginConfig = {}) {
       // 单路上游：baseArgs 已经含 failover / deadlineMs，漏传这两个会让
       // 「失败自动换后端」和「总预算封顶」在非 dual 路径上整体失效。
       // providerName 为空时不要塞 provider:''，否则 runConsult 会当成显式钉死某家。
+      // ❗judges 恰好一个时退化单路，**必须把它当成 provider 传下去**。
+      // 原实现只透传 providerName（空串），于是 judges:['quna-opus'] 实际跑的是默认链
+      // portdan→tokenfuture→aisz，调用方以为问的是 opus（第 4 轮会审 quna-opus 指出）。
+      // 这条比看起来严重：它是「静默换掉被问的那一家」，而会审的价值全在「问的是谁」。
+      const singleJudge = judgesGiven && args.judges.length === 1 ? String(args.judges[0] || '').trim() : '';
+      if (singleJudge && !CONSULT_PROVIDERS[singleJudge]) {
+        return {
+          ok: false, mode, ms: 0,
+          error: 'judges 里有不认识的 provider：' + singleJudge + '；可选 ' + Object.keys(CONSULT_PROVIDERS).join(' / '),
+        };
+      }
       const res = await runConsult({
         ...baseArgs,
-        ...(providerName ? { provider: providerName } : {}),
+        ...(singleJudge || providerName ? { provider: singleJudge || providerName } : {}),
+        materials: materialsText,
+        // ❗单路也要把覆盖核对交给判据（第 5 轮会审 sonnet 指出：
+        // 调用方传 failover:false 就走单路，原来这条路根本不看材料有没有进 prompt）。
+        materialCoverage,
+        // ❗同并行分支：用读材料那一刻的指纹，别让 runConsult 自己重取。
+        preFingerprint,
+        materialItems,
       });
       const answer = res.answer || {};
       // 不用 undefined 占位：快照要求无损 JSON，缺键比 undefined 安全。

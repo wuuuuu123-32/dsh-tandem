@@ -2,3 +2,15 @@ node_modules/
 state/
 *.log
 .DS_Store
+
+# 会审用的临时材料与产物：diff、源码切片、会审输出、探针与一次性会审脚本。
+# 它们每次改动都会重新生成，而且动辄几十 KB，不该进库。
+*.diff
+chunk-*.txt
+review-context.md
+review-*-out.txt
+review-*-result.json
+review-[a-z]*.mjs
+probe-*.mjs
+review-publish.md
+smoke-*-result.json

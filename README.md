@@ -205,6 +205,107 @@ tandem_delegate { tasks: [...], reviewId: "rv-1a2b3c4d5e6f7a8b" }
 
 排查：`~/.dsh/tandem-state/load.log` 里有 `auto rescue installed (...)`，之后每次 `rescue fire / announce / deliver / drop` 都有一行。
 
+## 跨厂商并行会审 + 材料注入（v0.8.0）
+
+v0.7 及以前，一次 `tandem_consult` 就是「问一条链路里的一位」。v0.8 把两件事拆开重做：**问谁**可以多家并行，**给它看什么**由插件负责而不是靠调用方复述。
+
+### 默认两家，一 GPT 一 Claude
+
+```text
+DEFAULT_JUDGES = ['portdan', 'quna-sonnet']
+       portdan      → gpt-6.1-sol       vendor: openai
+       quna-sonnet  → claude-sonnet-5-5 vendor: anthropic
+```
+
+理由不是「多一个模型更保险」，而是**跨厂商**：portdan / tokenfuture / aisz 全是 GPT 系，它们的一致不构成独立复核。quna-sonnet 与 quna-opus 虽然共用同一个中转站，但 vendor 都是 `anthropic`，`vendorCount` 会如实算成 **1 家**——同时选这两家不构成跨厂商意见，插件会在 note 里明说。
+
+用法与互斥：
+
+| 参数 | 含义 |
+|---|---|
+| `judges: ["portdan","quna-sonnet"]` | 显式指定；恰好一个元素时退化为单路（走 `runConsult`，不要求跨厂商） |
+| 不传 `judges` | 走 `DEFAULT_JUDGES` |
+| `provider: "portdan"` | 钉死单路，与 `judges` 互斥（同传直接报错，不静默二选一） |
+| `dual: true` / `failover: false` | 与 `judges` 同传同样报错 |
+
+并行的是**请求**，不是结论：顶层 `ok` = 至少一家成功，`partial` = 部分成功，`results[]` 逐家给 `ok/ms/conclusion/evidence/counterexamples/verification/verdict/source/log`，`failed[]` 给 `reason/hint/log`。一个反直觉但重要的推论：**两路里至少一路失败的概率 ≈ 35%，三路 ≈ 48%**（按单路成功率 80.3% 算），所以「多上几家」并不会自动让结论更可靠，只让等待更久、失败面更大。
+
+### 材料注入：把「我说它看了」变成「它真的看了」
+
+改之前，`paths` 只用于签凭证，内容从不进 prompt。于是会出现这种自欺：凭证声称覆盖了 `config.js`，而 judge 只看到调用方在 `context` 里复述的片段。这正是 10 月两次事故的病根——**凭证比证据强**。
+
+现在：
+
+- `material: ["a.js", "b.js"]` 显式指定要注入的文件；
+- **`paths` 里的文件默认也会被注入**（`materialStats.auto = true`），因为「声称审过却从未给对方看」本身就是矛盾的；
+- 注入的文件必须是受审路径的**完整内容**才算覆盖：截断的不算；**目录型 paths 一律不算覆盖**——目录里只要有一个文件进了 prompt，凭证就会声称「这个目录被审过」，那种凭证比没有更坏（要审目录请把文件逐个列进 `paths`）；
+- 用 diff 覆盖也可以，但**必须能与工作区对上**：每份像 diff 的材料都会跑 `git apply --check --reverse`（先规范化 CRLF），结果分 `ok / mismatch / unavailable`，只有 `ok` 才算覆盖。过期 diff、伪造 diff（`+++ b/x` 加一个 `@@` 就想蒙）都会被拒——否则随手编一份 diff 就能替任何文件作证；
+- 覆盖只说明「字节进了 prompt」，还要证明**是 judge 看的那一版**：`collectMaterials` 对自己读入的那段字节算 sha1，签发前 `checkMaterialFreshness` 重新读文件比对 sha 与长度（未截断时也比长度，否则「后面追加一段」察觉不到）。
+
+限制与拒绝（`collectMaterials`，纯函数、可单测）：
+
+| 项 | 值 / 规则 |
+|---|---|
+| 单文件 | 60 KB，超出截断并标记 `truncated`（**截断的文件不算覆盖**） |
+| 总量 | 200 KB |
+| 文件数 | 40 个，超出的合并成一条「因总量/文件数封顶未读取」而不是逐个报 |
+| 越界 | 只认 `workRoots`；**没配 `workRoots` 时 cwd 也不许当白名单根**（否则传 `cwd: "C:/Users/me"` 整棵主目录都能读） |
+| 禁止目录 | 按路径**段**判 `.git / node_modules / .ssh / .aws / .docker / .kube / .gnupg / .azure / .gcloud / .terraform / .vault`，另有裸名 `gcloud`（真实路径是 `.config/gcloud`），并覆盖 8.3 短名（`GIT~1`、`SSH~1`、`CONFIG~1.JSO`） |
+| 凭据 | `.env*`、`.envrc`、`credentials*`（含 `credentials.db`/`credentials.toml`）、`npmrc/netrc/pypirc/git-credentials`、`auth.json`、`id_(rsa\|dsa\|ecdsa\|ed25519)`、`*.pem/key/pfx/p12/p8/ppk/jks/keystore/tfstate/tfvars/kubeconfig/ovpn`、`service-account*.json`、`secrets.{yaml,yml,json,txt}`、`access_tokens*.db`、`msal_token_cache.bin`、`tandem.json`、`provider-state.json` |
+| Windows 变形 | 结尾点/空格（`key.pem.` 与 `key.pem` 等价）、8.3 短名前缀表（`CREDEN~1.YAM`、`ENV~1`）、**basename 里带任何冒号都拒**（`notes.txt:secret` 是 NTFS 命名流）；`README.md:Zone.Identifier` 放行（浏览器下载标记，不是凭据） |
+| 硬链接 / 竞态 | `nlink > 1` 直接拒；`open` 之后 `fstat` 比对 `dev/ino/size`，不一致就拒（挡住「检查完再换成别的文件」） |
+
+围栏长度自适应：文件内容里出现连续 4 个以上反引号时，包裹用的围栏会比它更长——否则被注入的内容可以提前闭合围栏，把自己抬成指令。
+
+### 凭证判据：从「有没有意见」改成「能不能背书」
+
+旧的签发条件只有「全部成功 + 无冲突 + 有 paths」。这条在实测里立刻露馅：两位 judge 都说「存在严重缺陷，必须修改」时冲突数为 0，凭证照样签发，而 `tandem_delegate` 会把它显示成「这部分审过」。**否决是结论，不是「没意见」。**
+
+现在签发判据收敛到一个纯函数 `decideReview({verdicts, failedCount, judgeCount, conflicts, paths, changedDuring, vendors, materialCoverage, fingerprintUnknown})`，八条依次拦：
+
+| # | 拒绝条件 | note 里的原话（节选） |
+|---|---|---|
+| 1 | 没指定 `paths` | 没有覆盖范围的标记无法证明任何内容是审过的 |
+| 2 | 有 judge 失败，或 `verdicts.length !== judgeCount` | 部分意见不足以声称这段内容被复核过 |
+| 2b | 有**未知的** verdict 值 | 未知判定值既不是通过也不是否决，不能放行 |
+| 3 | judge 之间结论冲突 | 冲突本身就是要停下来看的东西 |
+| 4 | 有任何一家判 fail | 否决是结论，不是「没意见」 |
+| 5 | 没有任何一家判 pass | 全都没表态不等于审过 |
+| 6 | 多路且 `vendors < 2` | 同一厂商的多个模型共享训练与偏好，不构成独立复核 |
+| 7 | `materialCoverage.ok === false` | 凭证不能为一篇没人看过的文件作证 |
+| 8 | `changedDuring` 或 `fingerprintUnknown` | 受审文件在会审期间发生了变化 |
+
+第 6、7 条只对多路生效（单路豁免），否则所有既有的单路调用会永远签不出凭证，闸门变成死锁。第 7 条在 v0.8 里取消了「单路不看材料」的旧豁免——这条限制的是**证据**，与「独立厂商有几家」无关。
+
+**判「通过 / 否决」以声明为准，正则是只能否决不能放行的兜底。** judge 的 JSON 里多一个字段：
+
+```json
+{ "verdict": "pass" | "fail" | "unclear", "conclusion": "...", "evidence": [...], "counterexamples": [...], "verification": "..." }
+```
+
+- 有声明就听声明（`source: "declared"`）；
+- 声明 `fail` / `unclear` 直接采纳；
+- 声明 `pass` 时正则仍可否决（正文说「不行」而字段写 pass，按不行算）；
+- **没有声明时，正则最多把回答读成 fail 或 unclear，永远读不出 pass**。
+
+最后这条是整次改造里最值钱的性质：一张凭证背后的「通过」，一定是某个模型显式写了 `"verdict": "pass"`，不是从散文里猜的。判方向靠正则读自由文本永远追不上措辞空间——本会话第 3、5、6、8、9、10 轮，每一轮都能找出一句新说法绕过词表（「当前版本不可用，修好后可以上线」「I would not approve this」「说它可以直接用是错误的」），这正是改用声明式字段的原因。
+
+签发失败时 note 说明是哪一条拦的；成功时 note 写明「已签发：A=pass、B=unclear，1 家厂商」，乙语义下 `unclear` 不挡路但不背书，结论原样带回。
+
+### 这套判据被自己审了 12 轮
+
+改的是「判据」，而按工作区规则改完还要它审自己——所以这段代码同时是被审对象和判据本身。历史：第 1 轮推翻「Codex 接受 `wire_api=chat`」这个未验证前提（实测报错 `wire_api = "chat" is no longer supported`，而 qunaapi 其实**有** `/v1/responses`，于是不需要 Chat 适配器）；第 2 轮起逐轮被挑出真路径：零位 judge 也签发、`judges: []` 过滤后为空数组、claude 系习惯套 ```json 围栏、opus 照抄正则导致 `Bad escaped character`、`没有声明 → 正则给 pass`、非字符串 verdict 被 `typeof` 丢掉导致 bogus 闸门失效、单路指纹取三次的竞态……
+
+已经**接受**的残留局限（不是漏审，是取舍）：
+
+1. 乙语义下，一家 pass + 一家 unclear 会签发——`unclear` 不背书也不否决，这是用户 2026-11-13 拍板的语义；
+2. 声明优先、正则兜底，于是「完全不给 verdict 字段」的回答只能表达否决或沉默，不能表达通过；
+3. 单路凭证弱一档（judgeCount=1 不要求跨厂商），它本来就只代表「问了一家，那家说可以」。
+
+### 自测
+
+`npm test` 里有 12 份纯离线冒烟（不需要网络、不花钱）：判据词表 31 条、单向闸门 15 条、`decideReview` 21 条（含「两家都否决 → 不签发」「一家 pass 一家 unclear → 签发并点名」「非字符串声明 → 不签发」「未知值 → 不签发」「取指纹失败 → 不签发」）、材料覆盖 7 条、凭据黑名单 25 种名字加 Windows 三种变形、围栏长度 5 条、路径分隔符 5 条、状态并发 5 条。会真的起 Codex 的两份在 `npm run test:live` 里单独跑。
+
 ## 会审失败 ≠ 没有意见
 
 `tandem_consult` 不是「问了就有答案」。它失败时会给出 `reason` 和 `hint` 两个字段，**那不是在说「没问题」**：
