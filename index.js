@@ -21,7 +21,7 @@ import { normalizeChecks, checksHash, runChecks, buildGapReport } from './lib/ac
 import { loadTickets, saveTickets, getTicket, recordCheck, normalizeDir } from './lib/tickets.js';
 import { findReview, reviewCovers, fingerprintPaths } from './lib/reviews.js';
 import { createLedger } from './lib/ledger.js';
-import { claimRound, recordRound, taskKeyFor, DEFAULT_MAX_ROUNDS } from './lib/budget.js';
+import { claimRound, recordRound, taskKeyFor, dualJudgeError, DEFAULT_MAX_ROUNDS } from './lib/budget.js';
 import { createRescue } from './lib/rescue.js';
 import { randomUUID } from 'node:crypto';
 import { ensureEnv, credentialsPath } from './lib/env.js';
@@ -106,6 +106,9 @@ const DEFAULTS = {
   // 24 小时内最多问几轮。默认 2 —— 第 3 轮直接拒绝，要越过必须显式 forceRound。
   // 这个数字来自一次事故：我自己在同一件事上连问 9 轮，用户在旁边等了 50 分钟。
   consultMaxRounds: 2,
+  // ❗会审默认必须跨厂商双跑（2026-11-13 用户要求）。judges 只给一家会被拒；
+  // 真想单路就显式传 provider（钉死问某一家），别用「挑人挑到只剩一家」这种伪并行写法。
+  consultRequireDual: true,
   // Codex 退出码 0 时还要看日志里有没有 "tokens used" 完成标记，没有就判空跑并重派。
   // 换 Codex 版本后若这个标记消失，设成 false 关掉（只是少一层保护，不影响派活）。
   requireCompletionMarker: true,
@@ -765,6 +768,14 @@ export function apply(ctx, pluginConfig = {}) {
       }
       if (judgesGiven && typeof args?.failover === 'boolean') {
         return { ok: false, mode, ms: 0, error: 'judges 与 failover 不能同时传：并行会审下「失败换后端」这件事由每个 judge 各自在内部处理，外层不用再指定' };
+      }
+      // ❗默认必须跨厂商双跑（2026-11-13 用户要求）。
+      // 起因：我在同一件事上连问 9 轮，为了「省时间」把 8 轮退成 judges:['portdan'] ——
+      // 既丢掉了交叉验证，又让每轮变便宜、于是更容易一轮接一轮地磨。
+      // 单路只剩一个合法入口：显式传 provider（= 钉死问某一家），那是调用方自己的决定。
+      const dualErr = judgesGiven ? dualJudgeError(args.judges, { requireDual: cfg.consultRequireDual !== false }) : '';
+      if (dualErr) {
+        return { ok: false, mode, ms: 0, error: dualErr };
       }
       // 退化规则（与工具描述一致）：
       //   · 不传 judges          → 默认双跑 DEFAULT_JUDGES（方案 B）
