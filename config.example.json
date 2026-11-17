@@ -13,5 +13,9 @@
   "reviewGuard": true,
   "reviewGuardFirst": 2,
   "reviewGuardEvery": 4,
-  "reviewGuardGate": "deny"
+  "reviewGuardGate": "deny",
+
+  "consultPhases": ["design", "delivery"],
+  "consultRequireDual": false,
+  "consultMaxRounds": 2
 }

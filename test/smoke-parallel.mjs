@@ -13,6 +13,10 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { runConsultParallel, CONSULT_PROVIDERS } from '../lib/consult.js';
 import { resolveCodexCommand } from '../lib/codex-path.js';
+if (process.env.TANDEM_ALLOW_LIVE !== '1') {
+  console.log('SKIP（这是会打真实上游的冒烟脚本；要真跑：TANDEM_ALLOW_LIVE=1 node test/<本文件>）');
+  process.exit(0);
+}
 
 const cfg = {
   workRoots: ['D:/dsh/config'],

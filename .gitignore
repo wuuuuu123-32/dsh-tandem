@@ -14,3 +14,13 @@ review-[a-z]*.mjs
 probe-*.mjs
 review-publish.md
 smoke-*-result.json
+
+# 改代码前留的手工备份（.bak-before-<改动>-<日期>）。留着是为了当场回退，
+# 不是要进版本库 —— 版本库本身就有历史，这些只会把 diff 搅乱。
+*.bak-before-*
+
+# 我自己的临时导出与调试入口（_test-out*.txt 是 node --test 的重定向输出，
+# _cold.mjs 是冷进程验证工具注册用的一次性脚本，_session-lib.js 是查 DSH 源码时导出的切片）。
+_test-out*.txt
+_cold.mjs
+_session-lib.js

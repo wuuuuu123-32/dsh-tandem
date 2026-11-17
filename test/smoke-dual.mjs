@@ -1,10 +1,18 @@
-// 「默认必须双跑」的验收（2026-11-13 用户要求：「你确保现在是双跑会审，最多 2 轮」）。
+// 会审「问几家」的验收。
 //
-// 现实背景：同一天我在一件事上连问 9 轮，其中 8 轮为了省时间把 judges 写成
-// ['portdan'] —— 表面还是「会审」，实际已经退化成单路，交叉验证没了。
-// 这个文件测两件事：
-//   ① 默认配置解析出来就是两家、且是不同厂商（不是同一家的两个型号）；
-//   ② judges 少于两家会被机制拒绝，而显式 provider 单路仍然合法（那是调用方明说的）。
+// 历史：
+//   2026-11-13 用户要求「默认必须跨厂商双跑」—— 起因是我同一天在一件事上连问 9 轮，
+//   其中 8 轮为了省时间把 judges 写成 ['portdan']，交叉验证没了。
+//   2026-11-17 用户决定改回「默认只问 GPT 一家」：
+//   「取消默认调用双方会审，默认只使用gpt」。
+//   依据是本机 397 条会审记录：quna-sonnet 成功率 64%（67 次失败 24 次），
+//   portdan 94%（143 次失败 8 次）；且 sonnet 失败时整条白等（实测一次 104 秒后 codex 退出码 1）。
+//
+// 这个文件现在测四件事：
+//   ① 默认集合只一家、且是 GPT 系（portdan / gpt-6.1-sol）；
+//   ② 并行路径没被删掉：显式给两家仍然放行、vendorCount 仍然 ≥ 2；
+//   ③ requireDual 的开关语义没变（默认 false，显式打开仍然拦单家）；
+//   ④ 轮次上限常量还在。
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -12,51 +20,34 @@ import assert from 'node:assert/strict';
 import { DEFAULT_JUDGES, CONSULT_PROVIDERS, vendorCount } from '../lib/consult.js';
 import { dualJudgeError, DEFAULT_MAX_ROUNDS } from '../lib/budget.js';
 
-test('默认 judges 至少两家', () => {
+test('默认只问一家（2026-11-17 用户决定）', () => {
   assert.ok(Array.isArray(DEFAULT_JUDGES), 'DEFAULT_JUDGES 必须是数组');
-  assert.ok(DEFAULT_JUDGES.length >= 2, '默认必须双跑，实际：' + JSON.stringify(DEFAULT_JUDGES));
+  assert.equal(DEFAULT_JUDGES.length, 1, '默认应为单家，实际：' + JSON.stringify(DEFAULT_JUDGES));
+  assert.deepEqual(DEFAULT_JUDGES, ['portdan']);
 });
 
-test('默认的两家必须是不同厂商（同厂商的两个型号不算交叉验证）', () => {
-  const vendors = vendorCount(DEFAULT_JUDGES);
-  assert.ok(vendors >= 2, '默认两家的厂商数必须 ≥ 2，实际 ' + vendors + ' 家：' + JSON.stringify(DEFAULT_JUDGES));
-  const vs = DEFAULT_JUDGES.map((j) => CONSULT_PROVIDERS[j]?.vendor);
-  assert.equal(new Set(vs).size, vs.length, '默认几家不能有重复厂商：' + JSON.stringify(vs));
+test('默认那一家是 GPT 系，模型名固定', () => {
+  const p = CONSULT_PROVIDERS[DEFAULT_JUDGES[0]];
+  assert.ok(p, '默认 judge 不在 CONSULT_PROVIDERS 里：' + DEFAULT_JUDGES[0]);
+  assert.equal(p.vendor, 'openai');
+  assert.equal(p.model, 'gpt-6.1-sol');
+  assert.ok(p.baseURL && /^https?:\/\//.test(p.baseURL), '缺 baseURL');
 });
 
-test('默认的每一家都在 provider 表里、有具体模型名', () => {
-  for (const j of DEFAULT_JUDGES) {
-    const p = CONSULT_PROVIDERS[j];
-    assert.ok(p, '默认 judge 不在 CONSULT_PROVIDERS 里：' + j);
-    assert.ok(p.model && typeof p.model === 'string', j + ' 缺 model');
-    assert.ok(p.baseURL && /^https?:\/\//.test(p.baseURL), j + ' 缺 baseURL');
-  }
-});
-
-test('默认为 portdan + quna-sonnet（用户 2026-11-13 定的日常配置）', () => {
-  assert.deepEqual(DEFAULT_JUDGES, ['portdan', 'quna-sonnet']);
-  assert.equal(CONSULT_PROVIDERS['portdan'].model, 'gpt-6.1-sol');
-  assert.equal(CONSULT_PROVIDERS['quna-sonnet'].model, 'claude-sonnet-5-5');
-});
-
-test('judges 只给一家 → 机制拒绝', () => {
-  assert.match(dualJudgeError(['portdan']), /至少要两家/);
-  assert.match(dualJudgeError(['portdan', 'portdan']), /至少要两家/, '重复同一个 provider 也只有一家');
-  assert.match(dualJudgeError(['portdan', '  ']), /至少要两家/, '空白项要被过滤掉');
-  assert.match(dualJudgeError([]), /至少要两家/);
-  assert.match(dualJudgeError(null), /至少要两家/);
-});
-
-test('judges 给两家 → 放行', () => {
+test('并行路径仍在：显式两家仍然放行、厂商数 ≥ 2', () => {
   assert.equal(dualJudgeError(['portdan', 'quna-sonnet']), '');
-  // 顺序无关、可以有空白
-  assert.equal(dualJudgeError([' quna-sonnet ', 'portdan']), '');
+  const vendors = vendorCount(['portdan', 'quna-sonnet']);
+  assert.ok(vendors >= 2, '显式双跑时厂商数必须 ≥ 2，实际 ' + vendors);
 });
 
-test('显式关掉这条路（consultRequireDual=false）才允许单家', () => {
+test('requireDual 默认不生效（单家放行），显式打开仍然拦', () => {
+  // 默认：不传 requireDual 视为关（与 index.js 里 cfg.consultRequireDual 默认 false 一致）
   assert.equal(dualJudgeError(['portdan'], { requireDual: false }), '');
+  // 显式打开：单家被拒，两家放行 —— 这是「想回到必须两家」的出口
+  assert.match(dualJudgeError(['portdan'], { requireDual: true }), /至少要两家/);
+  assert.equal(dualJudgeError(['portdan', 'quna-sonnet'], { requireDual: true }), '');
 });
 
-test('轮次上限默认 2', () => {
+test('轮次上限默认 2（任务级），返工层另有会话级常量', () => {
   assert.equal(DEFAULT_MAX_ROUNDS, 2);
 });

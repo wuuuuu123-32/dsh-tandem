@@ -21,7 +21,8 @@ import { normalizeChecks, checksHash, runChecks, buildGapReport } from './lib/ac
 import { loadTickets, saveTickets, getTicket, recordCheck, normalizeDir } from './lib/tickets.js';
 import { findReview, reviewCovers, fingerprintPaths } from './lib/reviews.js';
 import { createLedger } from './lib/ledger.js';
-import { claimRound, recordRound, taskKeyFor, dualJudgeError, DEFAULT_MAX_ROUNDS } from './lib/budget.js';
+import { claimRound, recordRound, releaseRound, taskKeyFor, dualJudgeError, DEFAULT_MAX_ROUNDS } from './lib/budget.js';
+import { claimRework, recordRework, reworkStatus, reworkPath, normalizePhase, pruneRework, PHASES, DEFAULT_RETENTION_MS } from './lib/rework.js';
 import { createRescue } from './lib/rescue.js';
 import { randomUUID } from 'node:crypto';
 import { ensureEnv, credentialsPath } from './lib/env.js';
@@ -103,12 +104,42 @@ const DEFAULTS = {
   workRoots: ['D:/dsh/work'],
   taskTimeoutMs: 300000,
   // ❗会审轮次上限（2026-11-13 用户要求写进机制）：同一个任务（按 paths 集合认身份）
-  // 24 小时内最多问几轮。默认 2 —— 第 3 轮直接拒绝，要越过必须显式 forceRound。
+  // 24 小时内最多问几轮。默认 2 —— 第 3 轮直接拒绝。
   // 这个数字来自一次事故：我自己在同一件事上连问 9 轮，用户在旁边等了 50 分钟。
+  // ⚠️ 它的任务身份来自**调用方措辞**（无 paths 时哈希 question 前 500 字），改写问法就换
+  // key、计数器从 0 重来 —— 所以它只是第一层，真正管住「磨轮次」的是下面的固定环节闸。
   consultMaxRounds: 2,
-  // ❗会审默认必须跨厂商双跑（2026-11-13 用户要求）。judges 只给一家会被拒；
-  // 真想单路就显式传 provider（钉死问某一家），别用「挑人挑到只剩一家」这种伪并行写法。
-  consultRequireDual: true,
+  // ❗固定环节闸（2026-11-17 用户要求，两次原话：
+  //   「我觉得应该在tandem插件里面加入机制避免你把会审当成了「测试机，不能这么拖拖拉拉啊」」
+  //   「这个固定环节可以是，设计完成动手前和动手完成交付前」）。
+  //
+  // 语义：**一轮对话只有两个会审节点** —— design（设计完成、动手之前）与 delivery（做完、
+  // 交付之前），每个各一次、判 fail 也照样算用掉、**没有时间窗口恢复**。
+  //
+  // 为什么必须是这一层：上面 consultMaxRounds 的身份由措辞决定，一天 7 个版本各审一次、
+  // `consultMaxRounds:2` 一次都没响（磁盘上 54 个 key、最近 7 个各不相同、每个只有 1 轮）。
+  // 这一层的身份是**根会话**（子代理顺着 header.parentSession 上溯），我改不掉措辞也换不掉。
+  //
+  // 两个阶段格的判定规则（portdan 会审裁定后重写）：
+  //   · phase 必填且必须是 'design' / 'delivery'，写错直接拒绝且**不消耗额度**；
+  //   · 同一 phase 第二次调用直接拒绝（fail/pass 都算用过，不能「拿 fail 就重问」）；
+  //   · 没有 24h 窗口 —— 窗口是存储清理期限（consultReworkRetentionDays），不能变成额度
+  //     有效期；额度按会话生命周期永久保存；
+  //   · 没有 cwd 兜底、没有 agent 可用的 forceRound 入口。人若要追加一次会审，那是政策例外：
+  //     人工直接编辑 consult-rework.json（agent 没有这个入口）；
+  //   · 账本读不出来 / 格式不对 → 拒绝会审（fail-closed），不能静默当成「还没用过」。
+  //
+  // 代价（必须让用户知道）：一个根会话里做五件互不相关的事，也只有两次会审额度。
+  // 需要更多时不是放宽机制，而是开新会话（那本来就是新的「一轮对话」）。
+  consultPhases: PHASES,
+  consultReworkRetentionDays: DEFAULT_RETENTION_MS / (24 * 60 * 60 * 1000),
+  // ❗2026-11-17 用户决定：取消默认双跑，默认只问 GPT 一家。
+  // 历史：2026-11-13 曾要求「默认必须跨厂商双跑」，起因是我在同一天把 8 轮会审退成单路来省时间。
+  // 现在放开，理由是本机实测 quna-sonnet 成功率仅 64% 且失败时整条白等（一次 104 秒），
+  // 而「防我磨轮次」这件事已经由下面的固定环节闸接管（consultPhases：design / delivery 各一次）
+  // —— 那层按根会话计阶段，与问几家无关，改回单路不会重新打开那个洞。
+  // 需要交叉验证时仍然显式传 judges:['portdan','quna-sonnet']，并行路径完整保留。
+  consultRequireDual: false,
   // Codex 退出码 0 时还要看日志里有没有 "tokens used" 完成标记，没有就判空跑并重派。
   // 换 Codex 版本后若这个标记消失，设成 false 关掉（只是少一层保护，不影响派活）。
   requireCompletionMarker: true,
@@ -273,6 +304,31 @@ export function apply(ctx, pluginConfig = {}) {
           },
         };
       } catch { /* 状态坏了不该让 status 失败 */ }
+      // ❗固定环节闸的当前占用量（2026-11-17 换掉「返工轮上限」那一版）。
+      // 不把这块显示出来的话，机制在跑但人看不见 —— 「这个会话 design 用掉没、delivery 还剩几次」
+      // 只能去翻 consult-rework.json，等于静默失效（第一版可观测性教训）。
+      let rework;
+      try {
+        const rows = reworkStatus(cfg.stateDir);
+        rework = {
+          phases: PHASES,
+          stateFile: reworkPath(cfg.stateDir),
+          retentionDays: cfg.consultReworkRetentionDays,
+          // 一条记录 = 一个根会话（子代理共用根的额度，所以这里按 rootSession 去重后列表很短）
+          sessions: rows.slice(0, 6).map(r => ({
+            key: r.key,
+            rootSession: r.rootSession || '',
+            used: r.used,
+            phases: Object.keys(r.phases || {}),
+            summary: r.summary || '',
+          })),
+        };
+      } catch (error) {
+        // ❗状态文件坏了要**说出来**，不能静默当成「一次都没用过」——
+        // 那会让额度看起来是满的，于是下一次会审被允许，等于把闸门交给一个坏文件。
+        rework = { phases: PHASES, stateFile: reworkPath(cfg.stateDir), retentionDays: cfg.consultReworkRetentionDays, sessions: [],
+          error: String((error && error.message) || error) };
+      }
       const value = {
         ok: notes.length === 0,
         codexCommand: cfg.codexCommand,
@@ -286,6 +342,7 @@ export function apply(ctx, pluginConfig = {}) {
         ...(lastConsult === undefined ? {} : { lastConsult }),
         ...(reviewGuard === undefined ? {} : { reviewGuard }),
         ...(consultChain === undefined ? {} : { consultChain }),
+        ...(rework === undefined ? {} : { rework }),
       };
       return value; // DSH 用 output.schema 校验返回值本身（不是 {content, structuredContent}），渲染交给 render
     },
@@ -413,14 +470,15 @@ export function apply(ctx, pluginConfig = {}) {
     description: '让本机 Codex（GPT）作为第二个有边界的判断者，复核我自己出的东西。凡是我设计的方案 / 实施计划 / 排查思路 / 架构选型，或要改插件、工具、脚本的功能实现，都在动手前或交付给用户前调它一次；它只挑问题、给反例，不写文件、不动仓库，回「结论/证据/反例/验证方式」四段。同一问题默认只问一次，出现新证据或明确分歧才追问。',
     parameters: {
       mode: { type: 'string', required: true, enum: MODES, description: '会审类型：compare 方案比较 / review 盲审 / arbitrate 冲突裁定 / crosscheck 交叉核验' },
+      phase: { type: 'string', required: true, enum: PHASES, description: '必填：这是哪个固定环节。design = 设计 / 方案 / 排查思路已经成形、还没动手改代码或动文件；delivery = 活已经干完、准备交付给用户之前。一轮对话只有这两个节点各一次，判 fail 也照样算用掉，没有时间窗口能恢复。写错或缺失会被直接拒绝且不消耗额度。' },
       question: { type: 'string', required: true, description: '要判断的问题本身，需自包含（Codex 看不到本对话）' },
       context: { type: 'string', description: '材料：需求原文、diff 摘要、测试结果、来源摘录' },
       options: { type: 'array', items: { type: 'string' }, description: 'mode=compare 时的候选方案（每条一句话）' },
       provider: { type: 'string', enum: ['portdan', 'tokenfuture', 'aisz', 'quna-sonnet', 'quna-opus'], description: '可选：钉死某条上游。portdan / tokenfuture 都是 gpt-6.1-sol，aisz 是 gpt-6.1-terra，quna-sonnet 是 claude-sonnet-5-5，quna-opus 是 claude-opus-5-5。不填就走链：当天第一次 portdan → tokenfuture → aisz，之后 tokenfuture → portdan → aisz（tf 报没余额后 24 小时内跳过它）。填了视为钉死，只问这一条。' },
-      judges: { type: 'array', items: { type: 'string' }, description: '可选：并行会审的 judge 列表（默认 ["portdan","quna-sonnet"] 即跨厂商双跑）。每位 judge 独立回答、互不拖累：顶层 ok = 至少一条成功，失败的列在 failed 里且不能当成「没意见」。若 judge 之间结论方向相反会列进 conflicts，此时不签发 reviewId。注意 quna-sonnet 与 quna-opus 同属一家厂商，同时选两个不构成跨厂商独立意见（返回里 vendors 会显示实际厂商数）。传 [] 或只传一个则退化为单路。' },
+      judges: { type: 'array', items: { type: 'string' }, description: '可选：并行会审的 judge 列表。默认不传 = 只问一家 ["portdan"]（GPT-6.1-sol，走 provider 链、失败自动换后端）；传两家以上才真的并行（每位独立回答、互不拖累），用来做交叉验证 —— 那是按需，不是默认。顶层 ok = 至少一条成功；失败的列在 failed 里，不能当成「没意见」。若 judge 之间结论方向相反会列进 conflicts，此时不签发 reviewId。注意 quna-sonnet 与 quna-opus 同属一家厂商，同时选两个不构成跨厂商独立意见（返回里 vendors 会显示实际厂商数）。传 [] 或只传一个则退化为单路。' },
       material: { type: 'array', items: { type: 'string' }, description: '可选：把指定文件的真实内容贴进 prompt（相对 cwd 或绝对路径）。只读、不修改。安全边界：必须在 cwd / workRoots 之内（realpath 后校验，挡符号链接逃逸）、拒绝 .env / .credentials.yaml / *.pem / *.key / id_rsa 等凭据文件、拒绝 .git / node_modules / .ssh 目录、单文件 60KB、总量 200KB 封顶（超了截断并标注）。被拒的文件会列进返回的 materialRejected，不会静默跳过。' },
       dual: { type: 'boolean', description: '可选：同时问遍布两条上游，两份回答都返回，用来对照两家的失败率、速度与判断差异。开了它就忽略 provider。' },
-      forceRound: { type: 'boolean', description: '可选：越过「同一任务最多 2 轮会审」的上限。默认不要传 —— 上限是机制（<stateDir>/consult-budget.json 按 paths 集合计数，24 小时窗口），用满之后工具会直接拒绝并要求把结果交回给人决定。只有在用户明确说「再问一轮」时才传 true，且被越过的那一轮同样记进历史。' },
+      forceRound: { type: 'boolean', description: '已废弃，传了也不会放宽固定环节闸（design / delivery 各一次）。留这个字段只为不破坏旧调用：它的作用现在只剩「给任务级 consult-budget.json 的那一层加 2 轮余量」。真要追加一次会审，那是政策例外 —— 人工直接编辑 <stateDir>/consult-rework.json。' },
       timeoutMs: { type: 'integer', description: '单次尝试的超时毫秒；默认 180000，夹在 30000~300000' },
       failover: { type: 'boolean', description: '可选：是否允许换后端（默认开）。不指定 provider 时控制整条链；显式指定 provider 时视为钉死，传 true 才补一条备用。本机执行器故障、缺环境变量、内容被策略拦截这三种情况不会切换（换后端只会同样失败，或等于绕过策略）。' },
       deadlineMs: { type: 'integer', description: '可选：整次会审的总预算毫秒（含重试与切换），默认 timeoutMs×2，夹在 60000~900000。到点就收手，不会把多次单次超时累加成总时长。三条实际限制要知道：(1) 后面还有备用后端时，每次给主端算超时会先扣掉 90000ms 预留，否则主端两次慢失败就能把预算吃干、备用一次都起不来；注意这是「扣给后面」，不保证备用真能拿到 90000ms —— 主端第一次仍可能占满 timeoutMs，预留只在后续每次计算时才生效，且还要再被下面两条继续压缩；(2) 备用 aisz 单次最多 120000ms（即使你给的 timeoutMs 和剩余预算更大）；(3) 剩余预算不足 18000ms 时不会启动任何新尝试（其中 3000ms 是留给自己清理进程与写盘的）。预算挡下后续尝试时，返回里会有 stoppedBy=budget 与 budgetNote，此时 reason 只代表最后一次真正跑完的尝试。' },
@@ -481,6 +539,22 @@ export function apply(ctx, pluginConfig = {}) {
               used: { type: 'integer', required: true },
               maxRounds: { type: 'integer', required: true },
               remaining: { type: 'integer', required: true },
+            },
+          },
+          // ❗这两项必须声明（2026-11-17）：运行时确实会返回，而这里是 additionalProperties:false ——
+          // 不声明的话，宿主照 schema 校验会把每一次正常会审都判成违规（第 18 轮会审同样的坑）。
+          phase: { type: 'string', description: '这次会审走的是哪个固定环节：design（动手前）或 delivery（交付前）。被拦下时是请求里传的那个值（可能为空字符串，因为非法值也会被拒）' },
+          rework: {
+            type: 'object',
+            description: '固定环节闸的状态：一轮对话 design / delivery 各一次，判 fail 也算用掉。reason 是为什么被拦（phase-used / bad-phase / same-as-last / lock-busy / corrupt-state / no-identity / state-unwritable / exhausted），used 是这个根会话已经用掉的阶段',
+            additionalProperties: false,
+            properties: {
+              reason: { type: 'string' },
+              phase: { type: 'string' },
+              used: { type: 'array', items: { type: 'string' } },
+              phases: { type: 'array', items: { type: 'string' } },
+              rootSession: { type: 'string' },
+              note: { type: 'string' },
             },
           },
           judges: { type: 'array', items: { type: 'string' }, description: '并行模式（传了 judges）时才有：这次实际问了哪几家' },
@@ -623,7 +697,7 @@ export function apply(ctx, pluginConfig = {}) {
       },
       render: renderJson,
     },
-    async execute(args) {
+    async execute(args, exec) {
       ensureEnv(cfg.envKey);
       const mode = args?.mode;
       const question = String(args?.question || '').trim();
@@ -748,9 +822,8 @@ export function apply(ctx, pluginConfig = {}) {
         failover: typeof args?.failover === 'boolean' ? args.failover : null,
         deadlineMs: Math.min(Math.max(Number(args?.deadlineMs) || timeoutMs * 2, 60000), 900000),
       };
-      // 并行会审（方案 B，2026-11-13）：默认就走多路，跨厂商双跑。
-      // ❗三条「退回单路」的显式信号，缺一不可 —— 否则工具描述里写的「默认双跑」
-      // 与代码实际行为不符（会审 portdan 指出：不传 judges 时永远走单路，描述在骗人）：
+      // 并行会审（原方案 B，2026-11-13）：传两家以上 judge 才真的并行。
+      // ❗2026-11-17 用户改回「默认只问 GPT」之后，默认路径就是单路；这里的三条信号仍然有效：
       //   ① 给了 provider        = 钉死问某一家；
       //   ② dual:true            = 老的「全表双跑」，行为要保留；
       //   ③ failover 传了布尔值   = 调用方明确在管「链式切换」这件事，别替他改语义。
@@ -769,29 +842,51 @@ export function apply(ctx, pluginConfig = {}) {
       if (judgesGiven && typeof args?.failover === 'boolean') {
         return { ok: false, mode, ms: 0, error: 'judges 与 failover 不能同时传：并行会审下「失败换后端」这件事由每个 judge 各自在内部处理，外层不用再指定' };
       }
-      // ❗默认必须跨厂商双跑（2026-11-13 用户要求）。
-      // 起因：我在同一件事上连问 9 轮，为了「省时间」把 8 轮退成 judges:['portdan'] ——
-      // 既丢掉了交叉验证，又让每轮变便宜、于是更容易一轮接一轮地磨。
-      // 单路只剩一个合法入口：显式传 provider（= 钉死问某一家），那是调用方自己的决定。
-      const dualErr = judgesGiven ? dualJudgeError(args.judges, { requireDual: cfg.consultRequireDual !== false }) : '';
+      // 2026-11-17 起默认只问 GPT 一家，所以这里不再拦「judges 只有一家」。
+      // 历史（原文保留在下面，防止有人以为这条是随手删的）：2026-11-13 曾要求默认必须跨厂商双跑，
+      // 起因是我在同一天把 8 轮会审退成 judges:['portdan'] 来省时间。
+      // 现在这个风险由固定环节闸（consultPhases）接住 ——
+      // 它按根会话计 design / delivery 各一次，与问几家无关，所以放开单家不会重新打开「一轮接一轮地磨」这个洞。
+      // ❗`consultRequireDual: true` 仍然有效：想回到「必须两家」只要在配置里打开它。
+      const dualErr = judgesGiven ? dualJudgeError(args.judges, { requireDual: cfg.consultRequireDual === true }) : '';
       if (dualErr) {
         return { ok: false, mode, ms: 0, error: dualErr };
       }
       // 退化规则（与工具描述一致）：
-      //   · 不传 judges          → 默认双跑 DEFAULT_JUDGES（方案 B）
+      //   · 不传 judges          → 用 DEFAULT_JUDGES；它现在只有一家（2026-11-17 起默认只问 GPT），
+      //                            所以默认就是**单路**，走 provider 链并能失败自动换后端。
+      //                            ❗「走链」在这里的含义要说准（第 18 轮会审 portdan 反例 2）：
+      //                            链上的 portdan / tokenfuture / aisz **全是 GPT 系**
+      //                            （gpt-6.1-sol / gpt-6.1-sol / gpt-6.1-terra），换后端不换厂商，
+      //                            所以走链仍然满足「默认只问 GPT」，不是把问题悄悄甩给 Claude。
+      //                            不加钉死是有意的：显式 provider 会关掉 failover（planStages 里
+      //                            profile 分支只建单后端），而上游抖动是常有的事，钉死等于让默认路径更脆。
+      //                            实际回答的是哪家会回在结果的 provider 字段里，调用方看得见。
       //   · judges 恰好一个       → 退化为单路（原描述如此承诺，原代码没做，会审 sonnet 指出）
       //   · judges: []           → 也退化为单路（「我就要单路但不想写 provider」的出口）
       //   · provider / dual:true → 各自的老行为
+      // ❗判「要不要并行」必须看**解析后**的 judge 数，不能只看「传没传 judges」：
+      //   默认集合只剩一家时若还进并行分支，就会用单家跑一遍并行路径 ——
+      //   那条路径不做 provider 链的 failover，上游一抖就整条失败，比单路更脆。
       // ❗`judges: ['  ']` 也要拒绝（第 18 轮会审 portdan 指出）：`length === 1` 让它走单路，
       // 而 trim 后 provider 是空串 → 静默落回默认 provider 链，问的那一家被换掉，成功还照签。
       if (Array.isArray(args?.judges) && args.judges.length && !args.judges.some(x => String(x == null ? '' : x).trim())) {
-        return { ok: false, mode, ms: 0, error: 'judges 里全是空白项：要么给具体的 provider 名，要么整个别传（不传就走默认双跑）' };
+        return { ok: false, mode, ms: 0, error: 'judges 里全是空白项：要么给具体的 provider 名，要么整个别传（不传就走默认那一家 GPT）' };
       }
+      // ❗判「要不要走并行」看**解析后**的 judge 名单（2026-11-17 用户要求默认只问 GPT）。
+      // 原实现只看「传没传 judges」：默认集合从两家缩到一家之后，不传 judges 仍会进并行分支，
+      // 于是默认会审跑的是「单家并行路径」—— 那条路径不过 provider 链、没有失败换后端，
+      // 一家上游抖动就整条失败，比正经单路更脆。
+      const effectiveJudges = [...new Set(
+        (Array.isArray(args?.judges) && args.judges.length ? args.judges : DEFAULT_JUDGES)
+          .map(n => String(n == null ? '' : n).trim()).filter(Boolean),
+      )];
       const wantParallel = !providerName
         && args?.dual !== true
         && typeof args?.failover !== 'boolean'
         && !(Array.isArray(args?.judges) && args.judges.length === 0)
-        && !(judgesGiven && args.judges.length === 1);
+        && !(judgesGiven && args.judges.length === 1)
+        && effectiveJudges.length >= 2;
 
       // ❗会审轮次上限：机制，不是记忆（2026-11-13 用户要求，原话「这个会审轮次限制要加入
       // 插件的机制管控里面，不能考某一次对话记住」）。
@@ -809,11 +904,55 @@ export function apply(ctx, pluginConfig = {}) {
           ms: 0,
           error: '这个任务已经用满 ' + budget.maxRounds + ' 轮会审，机制拦下了第 ' + (budget.used + 1) + ' 轮。' + budget.historyText
             + '处理办法：①把这几轮的意见消化完，按失败项改代码，改完由人决定要不要再问；'
-            + '②确实需要再问一轮时，由用户明确同意后传 forceRound: true（这一轮同样记进历史）；'
+            + '②确实需要再问一轮时，那属于政策例外：由人直接编辑 <stateDir>/consult-rework.json（agent 没有放宽闸门的工具入口 —— forceRound 传了也不放宽固定环节那层）；'
             + '③换一个任务身份（不同 paths）会重新计数 —— 但那是另一件事，不是绕过。',
           budget: { key: budgetKey, used: budget.used, maxRounds: budget.maxRounds, historyText: budget.historyText },
         };
       }
+
+      // ❗固定环节闸（2026-11-17 用户要求，见 DEFAULTS 里 consultPhases 的注释）。
+      // 与上面那层是 **AND** 关系：任一层拒绝，这次会审就不发出去。
+      // 为什么必须另起一层：上面那层的身份由**我的措辞**决定（无 paths 时哈希 question），
+      // 我每轮换个问法就换一个 key、计数器从 0 重来 —— 2026-11-17 一天 7 个版本各审一次、
+      // consultMaxRounds:2 一次都没响，就是这么绕过去的。
+      // 这一层的身份是**根会话**（子代理顺着 parentSession 上溯，拿不到独立额度），
+      // 阶段必须显式声明，design / delivery 各一次、判 fail 也算用掉、没有时间窗口恢复。
+      const materialPaths = Array.isArray(args?.paths) ? args.paths.map(String) : [];
+      const phaseRaw = args?.phase;
+      const rework = claimRework(cfg.stateDir, {
+        chain: sessionChainOf(exec),
+        phase: phaseRaw,
+        question,
+        paths: materialPaths,
+      });
+      if (!rework.allowed) {
+        // 第 2 层拒绝时，第 1 层的记账要**还回去**（claimRound 已经先落盘 pending 了），
+        // 否则「被这一层拦下的那一次」会白吃掉任务级额度。
+        // ❗但只有「确实没发出去」才退（这里确实没发，因为拦在同一函数里、在 runConsult 之前）。
+        try { releaseRound(cfg.stateDir, budgetKey); } catch {}
+        return {
+          ok: false,
+          mode,
+          ms: 0,
+          // ❗文案要能直接回答「为什么不让问了、现在该干什么」，否则被拦的人只会换个措辞再试 ——
+          //   那正是这一层要治的病。lock-busy 要单独说清「不是额度问题」。
+          error: (rework.reason === 'lock-busy' || rework.reason === 'bad-phase' ? '' : '机制拦下了这次会审（固定环节闸）。') + rework.error,
+          phase: rework.phase || String(phaseRaw == null ? '' : phaseRaw),
+          rework: {
+            reason: String(rework.reason || ''),
+            phase: rework.phase || null,
+            used: Array.isArray(rework.used) ? rework.used : [],
+            phases: PHASES,
+            rootSession: rework.rootSession || null,
+            note: '一轮对话只有两个会审节点：design（动手之前）与 delivery（交付之前），各一次。'
+              + '判定是 fail 还是 pass 都算用掉 —— 拿 fail 就改写措辞重问，不会恢复额度（这正是要拦的动作）。'
+              + '被拦下时的正路：按已拿到的意见把活干完、把「未获通过」如实说明，由人决定是否交付。'
+              + '需要追加一次是政策例外，人工编辑 <stateDir>/consult-rework.json，agent 没有这个入口。',
+          },
+        };
+      }
+      const reworkClaim = rework._ticket;
+      const reworkVerdicts = (v) => (Array.isArray(v) ? v : []);
 
       if (wantParallel) {
         const par = await runConsultParallel({
@@ -829,10 +968,13 @@ export function apply(ctx, pluginConfig = {}) {
           materialItems,
         });
         recordRound(cfg.stateDir, budgetKey, { ok: par.ok, verdicts: par.verdicts || [], reviewId: par.reviewId, ms: par.ms });
+        // 返工轮记账：并行分支的 verdicts 是 [{judge, verdict}] 形状，recordRework 会拆出 verdict。
+        recordRework(cfg.stateDir, reworkClaim, { ok: par.ok, verdicts: reworkVerdicts(par.verdicts), ms: par.ms });
         return {
           ...par,
           mode,
           budget: { key: budgetKey, round: budget.round, used: budget.used + 1, maxRounds: budget.maxRounds, remaining: budget.remaining },
+          rework: { phase: rework.phase, used: rework.used, phases: PHASES, rootSession: rework.rootSession || null },
           ...(materialRejected.length ? { materialRejected } : {}),
           ...(materialStats ? { materialStats } : {}),
         };
@@ -880,11 +1022,19 @@ export function apply(ctx, pluginConfig = {}) {
         });
         const bothOk = dual.every(d => d && d.ok);
         recordRound(cfg.stateDir, budgetKey, { ok: dual.some(d => d && d.ok), ms: Math.max(0, ...dual.map(d => d.ms)) });
+        // dual 下没有统一 verdict（两份独立意见），但「两家都失败」本身就是明确的返工信号；
+        // 传 fail 让下一轮算返工 —— 否则 dual 模式会成为不计数的免费通道。
+        recordRework(cfg.stateDir, reworkClaim, {
+          ok: dual.some(d => d && d.ok),
+          verdicts: dual.every(d => d && d.ok) ? ['pass'] : (dual.some(d => d && d.ok) ? ['unclear'] : ['fail']),
+          ms: Math.max(0, ...dual.map(d => d.ms)),
+        });
         return {
           ok: bothOk,
           mode,
           ms: Math.max(0, ...dual.map(d => d.ms)),
           budget: { key: budgetKey, round: budget.round, used: budget.used + 1, maxRounds: budget.maxRounds, remaining: budget.remaining },
+          rework: { phase: rework.phase, used: rework.used, phases: PHASES, rootSession: rework.rootSession || null },
           note: (bothOk ? 'dual 模式：两份回答都在 dual 里，逐条对照后再下判断；'
               : 'dual 模式但有上游失败（看各条的 reason/hint）；failed 的那条不能当成「没意见」；')
             + 'dual 下已忽略 provider 入参，也不签发 reviewId（两份独立意见不等于覆盖了某段改动）',
@@ -898,7 +1048,14 @@ export function apply(ctx, pluginConfig = {}) {
       // 原实现只透传 providerName（空串），于是 judges:['quna-opus'] 实际跑的是默认链
       // portdan→tokenfuture→aisz，调用方以为问的是 opus（第 4 轮会审 quna-opus 指出）。
       // 这条比看起来严重：它是「静默换掉被问的那一家」，而会审的价值全在「问的是谁」。
-      const singleJudge = judgesGiven && args.judges.length === 1 ? String(args.judges[0] || '').trim() : '';
+      // ❗2026-11-17 会审 portdan 反例：去重后的名单只剩一家时，这里也必须钉住它。
+      // 反例原话：「传入 judges:['portdan','portdan'] 时，去重后的 effectiveJudges 只有一家，
+      // 因此不并行；但 singleJudge 只检查原数组长度是否为 1，所以仍为空，单路分支不会传 provider，
+      // 可能改走 portdan→tokenfuture→aisz 链，超出显式指定范围。」
+      // 也就是「我明说了问 portdan，它却可能在 tokenfuture 上回答」——
+      // 与上面那条同性质，只是入口从「长度 1」变成了「去重后 1」。
+      // 判据改成：只要调用方给了 judges 且去重后只剩一家，就把它当 provider 钉死。
+      const singleJudge = (judgesGiven && effectiveJudges.length === 1) ? effectiveJudges[0] : '';
       if (singleJudge && !CONSULT_PROVIDERS[singleJudge]) {
         return {
           ok: false, mode, ms: 0,
@@ -923,12 +1080,20 @@ export function apply(ctx, pluginConfig = {}) {
         reviewId: res.reviewId,
         ms: res.ms,
       });
+      // 返工轮记账（单路分支）。上游整体失败（ok:false 且没有声明判定）时 recordRework
+      // 不扣额度 —— 那是网络/上游问题，不是我在反复磨同一件事。
+      recordRework(cfg.stateDir, reworkClaim, {
+        ok: res.ok,
+        verdicts: reworkVerdicts(res.verdicts || (res.verdict ? [res.verdict] : [])),
+        ms: res.ms,
+      });
       // 不用 undefined 占位：快照要求无损 JSON，缺键比 undefined 安全。
       return {
         ok: res.ok,
         mode,
         ms: res.ms,
         budget: { key: budgetKey, round: budget.round, used: budget.used + 1, maxRounds: budget.maxRounds, remaining: budget.remaining },
+        rework: { phase: rework.phase, used: rework.used, phases: PHASES, rootSession: rework.rootSession || null },
         ...(res.provider === undefined ? {} : { provider: res.provider }),
         ...(answer.conclusion === undefined ? {} : { conclusion: answer.conclusion }),
         ...(answer.evidence === undefined ? {} : { evidence: answer.evidence }),
@@ -1221,6 +1386,48 @@ export function apply(ctx, pluginConfig = {}) {
       if (typeof agent.id === 'string') return agent.id;
     } catch {}
     return '';
+  }
+
+  /**
+   * 会话链：叶子在前、根在最后（identityOf 取末位当根）。
+   *
+   * ❗为什么必须上溯到根（2026-11-17 portdan 设计会审的第一条要求）：
+   *   「固定环节额度必须由宿主签发给根会话、子代理只继承」。否则派一个子代理去干活，
+   *   子代理自己就是一个新 session，它就又能拿到 design + delivery 两次 —— 额度形同虚设。
+   *
+   * 依据（不是猜的）：`@deepseek-ai/dsh-session` 的 SessionHeader 有 `parentSession`
+   *   （`_session-lib.js:1096` 校验必须是 string、`:1909` 创建时写入），
+   *   且 `ctx.sessions.get(id)` 能按 id 取回 Session（`_session-lib.js:2072`）。
+   *
+   * 兜底：走不动就返回已经收集到的那一段（至少叶子那一个），不抛错 ——
+   *   这个函数只在「已经有会话身份」之后被调用，抛错会让整个工具崩掉。
+   */
+  function sessionChainOf(exec) {
+    const out = [];
+    const push = (v) => {
+      const s = String(v == null ? '' : v).trim().replace(/^s:/, '');
+      if (s && !out.includes(s)) out.push(s);
+    };
+    try {
+      const leafId = sessionOf(exec);
+      if (!leafId) return out;
+      push(leafId);
+      let cur = exec && exec.agent && exec.agent.session;
+      // 深度上限 8：正常最多「根 → 一层子代理」，链再长就是数据出了问题，
+      // 这里停下并返回已收集的（identityOf 会把最外层当根，宁可少给额度也不要死循环）。
+      for (let depth = 0; depth < 8; depth++) {
+        const header = cur && cur.header;
+        const parent = header && header.parentSession;
+        if (!parent) break;
+        push(parent);
+        let next = null;
+        try { next = ctx && ctx.sessions && typeof ctx.sessions.get === 'function' ? ctx.sessions.get(String(parent)) : null; } catch { next = null; }
+        // 取不到父 Session 就停：链末位已经是已知最高一代，identityOf 会把它当根。
+        if (!next) break;
+        cur = next;
+      }
+    } catch {}
+    return out;
   }
 
   // 复刻 @deepseek-ai/dsh-llm 的 createUserMessage 形状（不能 import：profile 的 node_modules 里没有这个包）。

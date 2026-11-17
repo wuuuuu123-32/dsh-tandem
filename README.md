@@ -10,7 +10,7 @@
 |---|---|---|
 | `tandem_status` | 查看当前是否可用：Codex 路径、模型、并发上限、允许派活的目录根、凭据是否就绪 | 第一次派活前、或派活报错后先看它 |
 | `tandem_delegate` | 把 N 个互不依赖的子任务并行交给 Codex；成功的任务返回 `taskId` | 每项必须给 `timeoutMs` 和 `acceptance`（怎么算干完了），缺失直接拒绝；`dir` 必须在白名单根内且互不重复 |
-| `tandem_consult` | 让 Codex 作为「第二个有边界的判断者」回答一个问题；成功时签发 `reviewId`（会审标记） | 只判断、不写文件；必须回「结论 / 证据 / 反例 / 验证方式」四段，缺段即判无效 |
+| `tandem_consult` | 让 Codex 作为「第二个有边界的判断者」回答一个问题；成功时签发 `reviewId`（会审标记） | 只判断、不写文件；必须回「结论 / 证据 / 反例 / 验证方式」四段，缺段即判无效；**必须传 `phase`**（`design` / `delivery`），一轮对话每个环节各一次 |
 | `tandem_check` | 对派活的产物跑机械验收：在任务目录执行命令，按退出码 + 输出包含判定；返回 `reviewed` / `stale` 与 `review` 标记 | 判据在首次检查时**冻结**（同一 taskId 改判据会被拒）；被审内容在会审后变了则 `stale: true`；只做门禁，不替代语义审阅 |
 | `tandem_reject` | 把验收缺口原样回灌给 Codex 重做（同一 taskId） | 最多 2 轮；要求最近一次检查确实失败；到上限把人拉回来决定 |
 
@@ -74,9 +74,16 @@ New-Item -ItemType Junction -Path node_modules\dsh-tandem -Target "D:\dsh\config
   "rescueAfterCalls": 15,
   "rescueAfterMin": 10,
   "rescueCooldownMin": 20,
-  "rescueMaxPerSession": 3
+  "rescueMaxPerSession": 3,
+  "consultPhases": ["design", "delivery"],
+  "consultRequireDual": false,
+  "consultMaxRounds": 2
 }
 ```
+
+- `consultPhases`：固定环节闸，两格各一次（v0.9.0）。见 [会审闸](#会审闸两个固定环节各一次v090取代轮次上限)。
+- `consultRequireDual`：`false`（v0.9.0）。设 `true` 退回 v0.8 的「默认必须两家厂商」。
+- `consultMaxRounds`：任务级那道闸还在（默认 2），现在只是第二道保险 —— 真正管事的是固定环节闸。
 
 - `codexCommand`：留 `codex` 即可，插件会自动探测 npm 全局安装位置，并优先用 `.exe`（Windows 下 spawn `.cmd` 需要额外包一层 cmd.exe）。
 - `workRoots`：允许派活的**目录白名单**——插件会拒绝工作根之外的 `dir`、互相包含或重复的 `dir`。注意它限制的是「任务从哪儿起步」，不是文件写入范围：Codex 以 `danger-full-access` 运行（Windows 沙箱实测会把 `workspace-write` 静默降级成只读，改不了文件），所以白名单挡得住手滑与误配，挡不住任务提示词里明目张胆的越界写入。要真正限制写入，得在 `checks` 里自己核验产物路径。
@@ -209,12 +216,15 @@ tandem_delegate { tasks: [...], reviewId: "rv-1a2b3c4d5e6f7a8b" }
 
 v0.7 及以前，一次 `tandem_consult` 就是「问一条链路里的一位」。v0.8 把两件事拆开重做：**问谁**可以多家并行，**给它看什么**由插件负责而不是靠调用方复述。
 
-### 默认两家，一 GPT 一 Claude
+### 默认两家，一 GPT 一 Claude（v0.8.0 的默认，v0.9.0 已改成默认一家）
+
+> **v0.9.0 起默认只问 `portdan` 一家**，下面的 `DEFAULT_JUDGES` 已不再是默认值。
+> 双跑能力完整保留，只是要显式传 `judges`。改的理由见 [默认只问一家 GPT](#默认只问一家-gptv090-改双跑是按需)。
 
 ```text
-DEFAULT_JUDGES = ['portdan', 'quna-sonnet']
+DEFAULT_JUDGES = ['portdan']            # v0.9.0
        portdan      → gpt-6.1-sol       vendor: openai
-       quna-sonnet  → claude-sonnet-5-5 vendor: anthropic
+       quna-sonnet  → claude-sonnet-5-5 vendor: anthropic   （按需显式加入）
 ```
 
 理由不是「多一个模型更保险」，而是**跨厂商**：portdan / tokenfuture / aisz 全是 GPT 系，它们的一致不构成独立复核。quna-sonnet 与 quna-opus 虽然共用同一个中转站，但 vendor 都是 `anthropic`，`vendorCount` 会如实算成 **1 家**——同时选这两家不构成跨厂商意见，插件会在 note 里明说。
@@ -320,24 +330,43 @@ DEFAULT_JUDGES = ['portdan', 'quna-sonnet']
 
 它**不**证明「这份代码没有安全问题」——judge 只读材料，看不到运行时。
 
-### 会审轮次上限：机制管，不是靠记性
+### 会审闸：两个固定环节，各一次（v0.9.0，取代「轮次上限」）
 
-同一件事连问九轮、每轮对方换一个新缺陷、用户等了 62 分钟 —— 这件事发生后加的硬约束：
+旧机制是「同一个任务最多问 N 轮」，任务身份由 `paths` 或者**问题的哈希**决定。它有一个当时没看出来的洞：
 
-- 同一个任务最多 **2 轮**（`consultMaxRounds`，默认 2）。**任务身份**按 `paths` 认（排序去重后取 sha1 前 12 位），没给 `paths` 就按 `question` 认 —— 所以「换一句话再问同一批文件」不会变成新任务。
-- 计数落在 `<stateDir>/consult-budget.json`，**窗口 24 小时**：过窗自动清零，不需要手动维护。
-- 放行时**先写一条 `pending` 占位再执行**：进程崩了也算用过一轮，不给「崩了重试＝免费轮次」留口子。
-- 第 3 轮会被直接拒绝，错误信息里带历史（每轮的时间与 verdict），并给出三条出路：换任务身份（那是另一件事，不是绕过）、由用户明确同意后传 `forceRound: true`（同样记进历史）、或者接受当前结论。
-- **`forceRound` 只有一种合法用法**：用户明确说「再问一轮」。自己觉得「这轮问到点子上了想再确认一下」不是理由。
+> 没有 `paths` 时，任务键是 `sha1(question 前 500 字)`。**换个问法就换一个键，计数器从 0 重来。**
 
-改判据、改材料后重跑会审，等于新的一轮 —— 这个上限就是为「每修一次就再问一次」这种循环设的。**修完要么拿到 pass，要么停手把剩余分歧如实报给用户。**
+这不是理论推演，是磁盘上的记录对出来的 —— `consult-budget.json` 里躺着 18 个键、每个只有 1 轮，`consultMaxRounds: 2` 一次都没响过。所谓「限 2 轮」，在「每修一次就换个措辞再问一次」的循环里从来没起过作用。
 
-### 默认必须双跑：单路是显式选择，不是省时间的默认
+现在改成**两个离散的格子**，取代可反复触碰的数字上限：
 
-- 不传 `judges` → 走 `DEFAULT_JUDGES`，也就是 `portdan` + `quna-sonnet`（一家 OpenAI 系、一家 Anthropic 系，`vendorCount` 必须 ≥ 2）。
-- **`judges` 少于两家会被直接拒绝**（`consultRequireDual`，默认 true）：`judges: ['portdan']` 这种写法看着像会审、实际是单路，且同一家的两个型号也不算交叉验证。
-- 真要只问一家，用 `provider` 参数钉死它 —— 语义清楚，调用方明确知道自己放弃了交叉验证。
-- 起因：2026-11-13 我在一件事上连问 9 轮，8 轮退成单路，用户问「你确保现在是双跑会审？」。⇒ 这类「为了快一点而悄悄降低标准」必须由代码挡，不能靠自觉。
+| 参数 | 说明 |
+|---|---|
+| `phase` | **必填**，只认 `design` / `delivery`。写错或漏写 → 直接拒绝，**且不消耗额度** |
+| `design` | 设计 / 方案 / 排查思路已经成形、还没动手改代码或动文件 |
+| `delivery` | 活已经干完、准备交付之前（要带上真实 diff 与运行证据） |
+
+- **一格用掉就永久用掉**：判 `fail` 不返还，判 `unclear` 也不返还。没有「再来一轮」这个概念，也没有时间窗口能恢复。
+- **身份是根会话**，不是我的措辞：子代理顺着 `header.parentSession` 上溯到根，`fork` 一个新会话拿不到独立额度。
+- **没有 `cwd` 兜底**（会混合无关工作、换个目录就绕过去了），**也没有 agent 可用的 `forceRound` 入口**（配置文件不是权限边界）。
+- 账本损坏或版本不符 → **fail-closed 拒绝**，不会静默当成「零次」。只有文件根本不存在才算空账本。
+- 放行时**先把 `pending` 落盘再发请求**；拿不到锁也 fail-closed。
+- 独立文件 `<stateDir>/consult-rework.json`，旧的 `consult-budget.json` 完全没动 —— 要回退不用清账本。
+
+**明确的代价**：一个根会话里做五件互不相关的事，也只有两次会审额度。这是取舍，不是遗漏。真要追加，那属于政策例外 —— 由人直接编辑 `consult-rework.json`，agent 没有放宽这一层的工具入口。
+
+**它做不到的事**（设计会审最后留下的一句话，我没能驳倒）：实现「两个阶段名各调用一次」不等于实现了「动手前」和「交付前」。靠调用方提交字符串和日志，证明不了时序。要真强制环节，宿主得自己维护受信基线、阶段状态和交付快照 —— 那超出这个插件的边界。
+
+### 默认只问一家 GPT（v0.9.0 改），双跑是按需
+
+- 不传 `judges` → 走 `DEFAULT_JUDGES = ['portdan']`，也就是 gpt-6.1-sol 一家。
+- 想交叉验证，显式传 `judges: ['portdan', 'quna-sonnet']` —— 要求 ≥ 2 家厂商的 `vendorCount` 判据仍然生效，只是不再默认开启。
+- `consultRequireDual` 默认 **false**；设成 `true` 就退回旧行为（`judges` 少于两家直接拒绝）。
+- 要钉死某一家，继续用 `provider` 参数。
+
+**为什么改**：397 条会审记录里，portdan 成功率 94%（143 次挂 8 次），quna-sonnet 64%（67 次挂 24 次）。后者失败时不是「少一份意见」，而是整条会审白等 —— 实测一次 104 秒后退出码 1，然后什么也没有。默认双跑的成本从「多一份独立意见」变成了「三分之一的概率白等两分钟」。
+
+这是 v0.8.0「默认必须双跑」的反向调整，理由不同：v0.8.0 那条规定是为了治「为了快一点而悄悄降低标准」，靠机制挡住我自己的懒惰；v0.9.0 这次不是降低标准，是那条链**可用性不够撑起默认位置**。一家稳定的 judge 加一次真材实料的会审，比两家里有一家常挂更有用。想要两家时它仍然在。
 
 ## 会审失败 ≠ 没有意见
 

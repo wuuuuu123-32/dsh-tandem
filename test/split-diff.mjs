@@ -5,6 +5,15 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 
 const [inp, prefix, limArg] = process.argv.slice(2);
+// ❗这不是测试文件，是命令行工具（放在 test/ 里只是图方便）。但 `node --test test/*.mjs`
+// 会把它一起跑起来，没有参数时 readFileSync(undefined) 抛
+// `TypeError [ERR_INVALID_ARG_TYPE]: The "path" argument must be of type string`，
+// 于是全量测试永远有 1 条红 —— 那条红是假的，会让人以为插件坏了（2026-11-17 修的）。
+// 没参数就打印用法并正常退出：被当测试跑时算通过（0 条断言），手动跑时看得懂怎么用。
+if (!inp || !prefix) {
+  console.log('用法: node split-diff.mjs <in.diff> <outPrefix> [每块上限字节, 默认 55000]');
+  process.exit(0);
+}
 const limit = Number(limArg) || 55000;
 const lines = readFileSync(inp, 'utf8').split('\n').map(l => l.replace(/\r+$/, ''));
 

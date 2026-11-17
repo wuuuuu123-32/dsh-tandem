@@ -1,5 +1,66 @@
 # 变更记录
 
+## 0.9.0 — 2026-11-17
+
+### 默认只问一家 GPT；会审闸从「轮次上限」换成「两个固定环节」
+
+这次是两件事，一件是省钱省时间，一件是修一个**从来没生效过**的限制。
+
+**一、取消默认双路会审，默认只问 portdan 一家。**
+
+`DEFAULT_JUDGES` 从 `['portdan', 'quna-sonnet']` 改成 `['portdan']`，`consultRequireDual` 默认从 `true` 改成 `false`。
+
+理由不是「一家更快」，是那条链撑不起默认位置。397 条会审记录统计：portdan 成功率 **94%**（143 次挂 8 次），quna-sonnet **64%**（67 次挂 24 次）。后者失败时不是「少一份意见」，是整条会审白等 —— 实测一次 104 秒后退出码 1，然后什么都没有，我得重问。默认双跑的成本因此从「多一份独立意见」变成「三分之一的概率白等两分钟」。
+
+顺带修掉一个连带 bug：`dualJudgeError` 的调用处写的是 `cfg.consultRequireDual !== false`，默认值改成 `false` 之后这个表达式**仍然为 true**，等于改了默认值也不生效。改成 `=== true` 才真正放开。
+
+**想要两家时它还在**：显式传 `judges: ['portdan', 'quna-sonnet']`，`vendorCount >= 2` 的判据照旧。设 `consultRequireDual: true` 就完整退回 v0.8 的行为。这一条不是降低标准，是承认「一家稳定的 judge 加一次真材实料的会审」比「两家里有一家常挂」更有用。
+
+**二、旧机制从来没拦住过任何事（磁盘上的实锤）。**
+
+旧机制是「同一个任务最多问 2 轮」。任务身份在没给 `paths` 时是 `sha1(question 前 500 字)`。于是 —— **换个问法就换一个键，计数器从 0 重来**。
+
+这不是推测。`consult-budget.json` 里躺着 **18 个键、每个只有 1 轮记录**，`consultMaxRounds: 2` 一次都没响过。我当时每轮都会把问题重写一遍（因为要补充新证据），于是每次都恰好落在「第 1 轮」。
+
+新的闸门是**两个离散的格子**，不是可以反复触碰的数字：
+
+| 参数 | 语义 |
+|---|---|
+| `phase: 'design'` | 设计 / 方案 / 排查思路已经成形、**还没动手改代码或动文件** |
+| `phase: 'delivery'` | 活已经干完、**准备交付之前**（要带上真实 diff 与运行证据） |
+
+- `phase` **必填**，只认这两个值。写错或漏写 → 直接拒绝**且不消耗额度**（改对再来，不罚人）。
+- 一格用掉就永久用掉：`fail` 不返还，`unclear` 也不返还。没有「再来一轮」这个概念。
+- **没有 24 小时窗口**（设计会审的判定：存储清理期限不能变成额度有效期）。
+- **身份是根会话**：子代理顺 `header.parentSession` 上溯到根，`fork` 一个新会话拿不到独立额度。
+- **没有 cwd 兜底**（会混合无关工作，而且换个目录就绕过去了）。
+- **没有 agent 可用的 `forceRound` 入口**。`forceRound` 参数保留但传了也不放宽这一层；要追加属于政策例外，由人直接编辑 `consult-rework.json`。
+- 账本损坏或版本不符 → **fail-closed 拒绝**，不会静默当成零次。只有文件不存在才算空账本。
+- 放行时**先把 `pending` 落盘再发请求**；拿不到锁也 fail-closed。
+- 独立文件 `<stateDir>/consult-rework.json`，旧的 `consult-budget.json` 一个字没动。
+- 被这一层拒绝时，`releaseRound` 把上层已经占掉的任务级额度**还回去** —— 被拦下的那次不该白吃额度。
+
+**明确的代价**：一个根会话里做五件互不相关的事，也只有两次额度。这是取舍，写在这里就是为了不让人以为它是 bug。
+
+**它做不到什么**：「两个阶段名各调用一次」不等于「动手前」和「交付前」。靠调用方提交字符串和日志，证明不了时序和真实性。要真强制环节，宿主得维护受信基线、阶段状态和交付快照，那超出这个插件的边界。这条是设计会审留给我的，我没能驳倒，如实记在这里。
+
+**三、测试。**
+
+- 新 `test/rework-phases.mjs`（11 条）：两个阶段各放行一次、同阶段第二次被拒且不消耗另一格、8 种非法 `phase` 全拒且零消耗、大小写空白容错、`fail`/`unclear` 不返还、子代理拿不到新额度、账本损坏 `corrupt-state`、旧 `version:1` 明确拒绝、指纹函数、`reworkStatus`、常量。
+- 新 `test/verify-single-judge.mjs`（16 条）：`judges: []` 过滤成空、`['portdan','portdan']` 去重后单路、`['  ','\t']` 全空白必须被拒不能静默走链、`requireDual` 三态、默认链上全是 OpenAI 系。
+- 新 `test/verify-gates-order.mjs`（14 条）：静态断言两道闸在「并行 / dual / 单路」三条分支**之前**，且三条分支都 `recordRework`。
+- `test/verify-gates-live.mjs` 改到 21/21、`test/verify-gates-coverage.mjs` 改到 13/13（都补了 `phase` 参数，灌额度改成按阶段补而不是硬灌 8 次）。
+- 删掉 `test/rework-budget.mjs`、`test/rework-bypass.mjs` —— 它们断言的是旧语义（`usedCost`/`maxRework`），留着只会红。备份留了 `.bak-before-phases-20261117`。
+- 全量 `node --test`（39 个文件）：**61 通过 / 0 失败**。
+
+**四、顺手修掉一个白烧钱的坑。**
+
+`node --test` 不带参数会把 `test/` 下**所有** `.mjs` 都收进来跑，包括两个手工冒烟脚本（`smoke-live.mjs`、`smoke-parallel.mjs`），它们写死了要真调 `runConsultParallel` 打上游。今天就这么白花了 **35 条真实请求、2732 秒**，其中 21 条失败。现在两个脚本都加了一条守卫：`TANDEM_ALLOW_LIVE !== '1'` 就打印 SKIP 并退出。
+
+**五、升级注意。**
+
+插件是 `link:` 装的，**必须重启 DSH** 才加载新代码。重启前 `tandem_status` 里看不到 `rework` 段、`consult-rework.json` 不会生成、调用会报 `sessionChainOf is not defined`（旧进程内存里没这个新函数）。
+
 ## 0.8.0 — 2026-11-13
 
 ### 会审从「问一条链」变成「问几家 + 给它看真材料」，凭证判据重做
