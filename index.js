@@ -941,13 +941,17 @@ export function apply(ctx, pluginConfig = {}) {
           // ❗文案要能直接回答「为什么不让问了、现在该干什么」，否则被拦的人只会换个措辞再试 ——
           //   那正是这一层要治的病。lock-busy 要单独说清「不是额度问题」。
           error: (rework.reason === 'lock-busy' || rework.reason === 'bad-phase' ? '' : '机制拦下了这次会审（固定环节闸）。') + rework.error,
-          phase: rework.phase || String(phaseRaw == null ? '' : phaseRaw),
+          phase: String(rework.phase || phaseRaw || ''),
           rework: {
             reason: String(rework.reason || ''),
-            phase: rework.phase || null,
+            // ❗这两个字段一律写字符串，不能写 null（2026-11-17 实测报错）：
+            //   schema 里声明的是 { type: 'string' }，而 bad-phase 分支里 rework.phase 是 null，
+            //   于是宿主校验直接判 "value.rework.phase must be a string"，连「阶段名写错了」
+            //   这句有用的提示都返回不出去 —— 拒绝路径自己变成了故障。
+            phase: String(rework.phase || ''),
             used: Array.isArray(rework.used) ? rework.used : [],
             phases: PHASES,
-            rootSession: rework.rootSession || null,
+            rootSession: String(rework.rootSession || ''),
             note: '一轮对话只有两个会审节点：design（动手之前）与 delivery（交付之前），各一次。'
               + '判定是 fail 还是 pass 都算用掉 —— 拿 fail 就改写措辞重问，不会恢复额度（这正是要拦的动作）。'
               + '被拦下时的正路：按已拿到的意见把活干完、把「未获通过」如实说明，由人决定是否交付。'
@@ -978,7 +982,7 @@ export function apply(ctx, pluginConfig = {}) {
           ...par,
           mode,
           budget: { key: budgetKey, round: budget.round, used: budget.used + 1, maxRounds: budget.maxRounds, remaining: budget.remaining },
-          rework: { phase: rework.phase, used: rework.used, phases: PHASES, rootSession: rework.rootSession || null },
+          rework: { phase: String(rework.phase || ''), used: rework.used, phases: PHASES, rootSession: String(rework.rootSession || '') },
           ...(materialRejected.length ? { materialRejected } : {}),
           ...(materialStats ? { materialStats } : {}),
         };
@@ -1038,7 +1042,7 @@ export function apply(ctx, pluginConfig = {}) {
           mode,
           ms: Math.max(0, ...dual.map(d => d.ms)),
           budget: { key: budgetKey, round: budget.round, used: budget.used + 1, maxRounds: budget.maxRounds, remaining: budget.remaining },
-          rework: { phase: rework.phase, used: rework.used, phases: PHASES, rootSession: rework.rootSession || null },
+          rework: { phase: String(rework.phase || ''), used: rework.used, phases: PHASES, rootSession: String(rework.rootSession || '') },
           note: (bothOk ? 'dual 模式：两份回答都在 dual 里，逐条对照后再下判断；'
               : 'dual 模式但有上游失败（看各条的 reason/hint）；failed 的那条不能当成「没意见」；')
             + 'dual 下已忽略 provider 入参，也不签发 reviewId（两份独立意见不等于覆盖了某段改动）',
@@ -1097,7 +1101,7 @@ export function apply(ctx, pluginConfig = {}) {
         mode,
         ms: res.ms,
         budget: { key: budgetKey, round: budget.round, used: budget.used + 1, maxRounds: budget.maxRounds, remaining: budget.remaining },
-        rework: { phase: rework.phase, used: rework.used, phases: PHASES, rootSession: rework.rootSession || null },
+        rework: { phase: String(rework.phase || ''), used: rework.used, phases: PHASES, rootSession: String(rework.rootSession || '') },
         ...(res.provider === undefined ? {} : { provider: res.provider }),
         ...(answer.conclusion === undefined ? {} : { conclusion: answer.conclusion }),
         ...(answer.evidence === undefined ? {} : { evidence: answer.evidence }),

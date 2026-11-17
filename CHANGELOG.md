@@ -1,5 +1,19 @@
 # 变更记录
 
+## 0.9.2 — 2026-11-17
+
+### 拒绝分支自己变成了故障：`rework` 里的 `null` 撞上 `string` 声明
+
+0.9.1 修的是「`rework` 没在 schema 里声明」。这一版修的是紧接着露出来的第二层：键声明了，但拒绝分支把 `rework.phase` / `rework.rootSession` 写成 `null`，而 schema 声明的是 `{ type: 'string' }` —— 宿主校验直接判 `value.rework.phase must be a string`。
+
+这个后果比不声明更糟：故意写错阶段名时，本该返回「`phase` 只能是 `design` 或 `delivery`，这次没消耗额度」这句有用的提示，结果返回的是一条校验错误 —— **拒绝路径自己变成了故障**，而它本来是专门用来给出可操作提示的。
+
+修法：拒绝分支与三处成功分支统一写 `String(... || '')`，不再传 `null`。
+
+测试同时加强：原来只查「顶层键有没有声明」，现在逐字段比类型（含嵌套）。`validateShape()` 覆盖 `type` / `properties` / `items`，`null` 撞 `string` 能直接抓到。`test/verify-schema-match.mjs` 从 10 条增到 **17 条**。
+
+离线全量 `node --test`：**58 通过 / 0 失败**。
+
 ## 0.9.1 — 2026-11-17
 
 ### 修 `tandem_status` 返回违规：`rework` 段没在 schema 里声明
@@ -9,6 +23,7 @@
 这类错读源码看不出来：字段加对了、逻辑也对，错的只是「返回值结构」和「声明」之间那一层。补了 `test/verify-schema-match.mjs`（10 条）：冷进程 `apply()` 拿到真实工具，**真调一次**（status / consult 首次 / consult 被拒分支 / consult 非法 phase / delegate 缺 acceptance / check 与 reject 的拒绝分支），把实际返回的顶层键逐个对 `output.schema.properties`，任何未声明的键直接失败。已进 `npm test`。
 
 离线全量 `node --test`：**58 通过 / 0 失败**。
+
 ## 0.9.0 — 2026-11-17
 
 ### 默认只问一家 GPT；会审闸从「轮次上限」换成「两个固定环节」

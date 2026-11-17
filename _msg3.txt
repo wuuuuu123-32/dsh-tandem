@@ -1,0 +1,16 @@
+v0.9.2：拒绝分支自己变成故障（rework 里的 null 撞上 string 声明）
+
+v0.9.1 修的是「rework 没在 schema 里声明」。这一版修的是紧接着露出来的第二层：
+键声明了，但拒绝分支把 rework.phase / rework.rootSession 写成 null，
+而 schema 声明的是 { type: 'string' } —— 宿主校验直接判
+"value.rework.phase must be a string"。
+
+后果比不声明更糟：故意写错阶段名时，本该返回「phase 只能是 design 或 delivery，
+这次没消耗额度」这句有用的提示，结果返回的是校验错误 —— 拒绝路径自己变成了故障。
+
+修法：拒绝分支与三处成功分支统一写 String(... || '')，不再传 null。
+测试也从「只查顶层键有没有声明」加强到「逐字段比类型（含嵌套）」：
+validateShape() 覆盖 type / properties / items，null 撞 string 能直接抓到。
+test/verify-schema-match.mjs 从 10 条增到 17 条。
+
+离线全量 node --test：58 通过 0 失败。
