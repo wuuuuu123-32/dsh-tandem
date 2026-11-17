@@ -1,5 +1,14 @@
 # 变更记录
 
+## 0.9.1 — 2026-11-17
+
+### 修 `tandem_status` 返回违规：`rework` 段没在 schema 里声明
+
+给 `tandem_status` 加 `rework` 段的时候，忘了在它的 `output.schema.properties` 里声明这一项。于是 `execute` 算好了、值也返回了，宿主按 `additionalProperties: false` 把整个返回判成违规 —— 报 `value.rework is not a declared property`，连配置都看不全。
+
+这类错读源码看不出来：字段加对了、逻辑也对，错的只是「返回值结构」和「声明」之间那一层。补了 `test/verify-schema-match.mjs`（10 条）：冷进程 `apply()` 拿到真实工具，**真调一次**（status / consult 首次 / consult 被拒分支 / consult 非法 phase / delegate 缺 acceptance / check 与 reject 的拒绝分支），把实际返回的顶层键逐个对 `output.schema.properties`，任何未声明的键直接失败。已进 `npm test`。
+
+离线全量 `node --test`：**58 通过 / 0 失败**。
 ## 0.9.0 — 2026-11-17
 
 ### 默认只问一家 GPT；会审闸从「轮次上限」换成「两个固定环节」

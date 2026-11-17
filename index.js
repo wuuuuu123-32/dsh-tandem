@@ -244,6 +244,10 @@ export function apply(ctx, pluginConfig = {}) {
           lastConsult: { type: 'object' },
           reviewGuard: { type: 'object' },
           consultChain: { type: 'object' },
+          // ❗固定环节闸的占用量（2026-11-17）。漏声明这一项的话，execute 明明算好了
+          // rework 也返回了，宿主会因为 additionalProperties:false 把整个返回判成违规 ——
+          // tandem_status 直接报 "value.rework is not a declared property"，连配置都看不全。
+          rework: { type: 'object' },
         },
       },
       render: renderJson,
