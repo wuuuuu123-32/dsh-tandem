@@ -373,7 +373,7 @@ DEFAULT_JUDGES = ['portdan']            # v0.9.0
 
 - **本地时间在前、标注在后**。UTC 放前面读者仍会按 UTC 心算，等于没修。
 - 坏值**不返回空串、也不退回当前时间** —— 那会把坏数据伪装成「刚刚」。
-- 同一写法在四处（`rework.js` × 2、`budget.js`、`index.js` × 2）一起改掉，回归测试 `test/time-stamp.mjs` 钉住「当初读错的那件事」，并扫描源码防止改回去。
+- 同一写法共 **5 处**（`rework.js` 的拒绝文案与 `describeUsed()`、`budget.js` 的 `describe()`、`index.js` 的两处 `reviewId · ${rev.at}`）一起改掉，回归测试 `test/time-stamp.mjs` 钉住「当初读错的那件事」，并扫描源码防止改回去。
 
 ### 默认只问一家 GPT（v0.9.0 改），双跑是按需
 

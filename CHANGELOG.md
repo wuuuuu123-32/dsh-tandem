@@ -29,7 +29,7 @@ localStamp('not-a-time')                →  '时间无法解析(not-a-time)'
 - **认不出来的值绝不返回空串、也绝不退回当前时间** —— 那会把坏数据伪装成「刚刚」。空值给「时间未知」，有值但读不懂就连原文片段一起给出来。
 - 为什么不复用 `consult.js` 里已有的 `localDay()`：它是**日期**粒度（给 portdan 的「每天一次」锁文件用的），而这里要秒级时刻；且 `consult.js` 依赖链很重（spawn / tickets / reviews），不适合被 `rework.js` 和 `budget.js` 反向依赖。新模块只依赖 `Date`，不会成环。
 
-#### 同一个 bug 的四个副本，一次修完
+#### 同一个 bug 的五个副本，一次修完
 
 grep `replace('T', ' ')` 找出全部同类写法（都在 `lib/time.js` 头部的注释里留了原样，作为"别再写回去"的说明）：
 
@@ -38,7 +38,8 @@ grep `replace('T', ' ')` 找出全部同类写法（都在 `lib/time.js` 头部�
 | `lib/rework.js` `claimRework()` 拒绝文案 | 会审被额度闸拦下时 —— **就是骗到我的那一处** |
 | `lib/rework.js` `describeUsed()` | `tandem_status` 的 `rework.sessions[].summary` |
 | `lib/budget.js` `describe()` | 任务级「已问 N 轮」的逐轮历史 |
-| `index.js` 两处 `reviewId · ${rev.at}` | 派活票据与验收回执上的会审标记行 |
+| `index.js` `tandem_delegate` 返回的 `review` 行 | 派活回执上的会审标记 |
+| `index.js` `tandem_check` 返回的 `reviewLine` | 验收回执上的会审标记 |
 
 #### 回归测试：`test/time-stamp.mjs`（4 条，已进 `npm test`）
 
