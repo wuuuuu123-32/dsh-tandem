@@ -23,6 +23,8 @@ import { findReview, reviewCovers, fingerprintPaths } from './lib/reviews.js';
 import { createLedger } from './lib/ledger.js';
 import { claimRound, recordRound, releaseRound, taskKeyFor, dualJudgeError, DEFAULT_MAX_ROUNDS } from './lib/budget.js';
 import { claimRework, recordRework, reworkStatus, reworkPath, normalizePhase, pruneRework, PHASES, DEFAULT_RETENTION_MS } from './lib/rework.js';
+// 时间显示一律走 localStamp：账本里存 UTC，裸截断会让人按本地时间读错（详见 lib/time.js）。
+import { localStamp } from './lib/time.js';
 import { createRescue } from './lib/rescue.js';
 import { randomUUID } from 'node:crypto';
 import { ensureEnv, credentialsPath } from './lib/env.js';
@@ -459,7 +461,7 @@ export function apply(ctx, pluginConfig = {}) {
         rejected: [],
         ...(review
           ? {
-              review: `${review.reviewId} · ${review.at} · ${review.mode}${
+              review: `${review.reviewId} · ${localStamp(review.at)} · ${review.mode}${
                 review.paths && review.paths.length ? ' · 覆盖 ' + review.paths.join(' | ') : ''
               }`,
             }
@@ -1255,7 +1257,7 @@ export function apply(ctx, pluginConfig = {}) {
         const rev = findReview(cfg.stateDir, ticket.reviewId);
         if (rev) {
           reviewed = true;
-          reviewLine = `${rev.reviewId} · ${rev.at} · ${rev.mode}${rev.paths && rev.paths.length ? ' · 覆盖 ' + rev.paths.join(' | ') : ''}`;
+          reviewLine = `${rev.reviewId} · ${localStamp(rev.at)} · ${rev.mode}${rev.paths && rev.paths.length ? ' · 覆盖 ' + rev.paths.join(' | ') : ''}`;
           if (rev.paths && rev.paths.length && !reviewCovers(rev, targetDir)) {
             note = (note ? note + '；' : '') + '会审标记的覆盖路径不含本次任务目录（标记只是内容标注，不阻断验收）';
           }
