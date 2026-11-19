@@ -115,12 +115,17 @@ const DEFAULTS = {
   //   「我觉得应该在tandem插件里面加入机制避免你把会审当成了「测试机，不能这么拖拖拉拉啊」」
   //   「这个固定环节可以是，设计完成动手前和动手完成交付前」）。
   //
-  // 语义：**一轮对话只有两个会审节点** —— design（设计完成、动手之前）与 delivery（做完、
+  // 语义：**每一轮对话都有两个会审节点** —— design（设计完成、动手之前）与 delivery（做完、
   // 交付之前），每个各一次、判 fail 也照样算用掉、**没有时间窗口恢复**。
+  //
+  // ❗「一轮对话」= 一个 turn（用户发一句话→我干一轮活），不是整个 Session。
+  //   2026-11-19 用户的纠正原话：「我图一的意思是一轮对话两个额度啊，不是本会话两个额度！」。
+  //   turn 号来自内核 `ctx.agents.turnBoundaryOf(rootSession).lastTurn`（见 turnOf 的注释）。
   //
   // 为什么必须是这一层：上面 consultMaxRounds 的身份由措辞决定，一天 7 个版本各审一次、
   // `consultMaxRounds:2` 一次都没响（磁盘上 54 个 key、最近 7 个各不相同、每个只有 1 轮）。
-  // 这一层的身份是**根会话**（子代理顺着 header.parentSession 上溯），我改不掉措辞也换不掉。
+  // 这一层的身份是**根会话 + 本轮 turn**（子代理顺着 header.parentSession 上溯到根、沿用根的 turn），
+  // 我改不掉措辞，也换不掉身份。
   //
   // 两个阶段格的判定规则（portdan 会审裁定后重写）：
   //   · phase 必填且必须是 'design' / 'delivery'，写错直接拒绝且**不消耗额度**；
@@ -131,8 +136,9 @@ const DEFAULTS = {
   //     人工直接编辑 consult-rework.json（agent 没有这个入口）；
   //   · 账本读不出来 / 格式不对 → 拒绝会审（fail-closed），不能静默当成「还没用过」。
   //
-  // 代价（必须让用户知道）：一个根会话里做五件互不相关的事，也只有两次会审额度。
-  // 需要更多时不是放宽机制，而是开新会话（那本来就是新的「一轮对话」）。
+  // 代价（必须让用户知道）：**同一轮**里做五件互不相关的事，也只有两次会审额度；
+  // 下一轮对话（用户再发一句话）自动重新给两格。
+  // 若某轮确实需要更多，不是放宽机制，而是在那一轮里想清楚要审哪两件最关键的。
   consultPhases: PHASES,
   consultReworkRetentionDays: DEFAULT_RETENTION_MS / (24 * 60 * 60 * 1000),
   // ❗2026-11-17 用户决定：取消默认双跑，默认只问 GPT 一家。
@@ -320,10 +326,12 @@ export function apply(ctx, pluginConfig = {}) {
           phases: PHASES,
           stateFile: reworkPath(cfg.stateDir),
           retentionDays: cfg.consultReworkRetentionDays,
-          // 一条记录 = 一个根会话（子代理共用根的额度，所以这里按 rootSession 去重后列表很短）
+          // 一条记录 = 一个根会话 + 一轮 turn（v3 起每轮一个键；子代理共用根那一轮的额度，
+          // 所以同一个根会话会在列表里出现多次，每次一行、各自带轮次号）
           sessions: rows.slice(0, 6).map(r => ({
             key: r.key,
             rootSession: r.rootSession || '',
+            turn: Number.isInteger(r.turn) ? r.turn : null,
             used: r.used,
             phases: Object.keys(r.phases || {}),
             summary: r.summary || '',
@@ -476,7 +484,7 @@ export function apply(ctx, pluginConfig = {}) {
     description: '让本机 Codex（GPT）作为第二个有边界的判断者，复核我自己出的东西。凡是我设计的方案 / 实施计划 / 排查思路 / 架构选型，或要改插件、工具、脚本的功能实现，都在动手前或交付给用户前调它一次；它只挑问题、给反例，不写文件、不动仓库，回「结论/证据/反例/验证方式」四段。同一问题默认只问一次，出现新证据或明确分歧才追问。',
     parameters: {
       mode: { type: 'string', required: true, enum: MODES, description: '会审类型：compare 方案比较 / review 盲审 / arbitrate 冲突裁定 / crosscheck 交叉核验' },
-      phase: { type: 'string', required: true, enum: PHASES, description: '必填：这是哪个固定环节。design = 设计 / 方案 / 排查思路已经成形、还没动手改代码或动文件；delivery = 活已经干完、准备交付给用户之前。一轮对话只有这两个节点各一次，判 fail 也照样算用掉，没有时间窗口能恢复。写错或缺失会被直接拒绝且不消耗额度。' },
+      phase: { type: 'string', required: true, enum: PHASES, description: '必填：这是哪个固定环节。design = 设计 / 方案 / 排查思路已经成形、还没动手改代码或动文件；delivery = 活已经干完、准备交付给用户之前。**每一轮对话**都有这两个节点各一次（一轮 = 你发一句话我干一轮活；下一轮自动重新给两格），判 fail 也照样算用掉，没有时间窗口能恢复。写错或缺失会被直接拒绝且不消耗额度。' },
       question: { type: 'string', required: true, description: '要判断的问题本身，需自包含（Codex 看不到本对话）' },
       context: { type: 'string', description: '材料：需求原文、diff 摘要、测试结果、来源摘录' },
       options: { type: 'array', items: { type: 'string' }, description: 'mode=compare 时的候选方案（每条一句话）' },
@@ -552,7 +560,7 @@ export function apply(ctx, pluginConfig = {}) {
           phase: { type: 'string', description: '这次会审走的是哪个固定环节：design（动手前）或 delivery（交付前）。被拦下时是请求里传的那个值（可能为空字符串，因为非法值也会被拒）' },
           rework: {
             type: 'object',
-            description: '固定环节闸的状态：一轮对话 design / delivery 各一次，判 fail 也算用掉。reason 是为什么被拦（phase-used / bad-phase / same-as-last / lock-busy / corrupt-state / no-identity / state-unwritable / exhausted），used 是这个根会话已经用掉的阶段',
+            description: '固定环节闸的状态：**每一轮对话** design / delivery 各一次（一轮 = 用户发一句话我干一轮活；下一轮自动刷新），判 fail 也算用掉。reason 是为什么被拦（phase-used / bad-phase / same-as-last / lock-busy / corrupt-state / no-identity / state-unwritable / exhausted），used 是**本轮**已经用掉的阶段',
             additionalProperties: false,
             properties: {
               reason: { type: 'string' },
@@ -560,6 +568,7 @@ export function apply(ctx, pluginConfig = {}) {
               used: { type: 'array', items: { type: 'string' } },
               phases: { type: 'array', items: { type: 'string' } },
               rootSession: { type: 'string' },
+              turn: { type: 'integer', description: '本轮对话的轮次号（内核 turn/start 的编号）；额度按它刷新。拿不到时为 null' },
               note: { type: 'string' },
             },
           },
@@ -921,12 +930,16 @@ export function apply(ctx, pluginConfig = {}) {
       // 为什么必须另起一层：上面那层的身份由**我的措辞**决定（无 paths 时哈希 question），
       // 我每轮换个问法就换一个 key、计数器从 0 重来 —— 2026-11-17 一天 7 个版本各审一次、
       // consultMaxRounds:2 一次都没响，就是这么绕过去的。
-      // 这一层的身份是**根会话**（子代理顺着 parentSession 上溯，拿不到独立额度），
-      // 阶段必须显式声明，design / delivery 各一次、判 fail 也算用掉、没有时间窗口恢复。
+      // 这一层的身份是**根会话 + 本轮的 turn**（子代理顺着 parentSession 上溯到根、沿用根的 turn 号，
+//       // 拿不到独立额度），阶段必须显式声明，每轮 design / delivery 各一次、判 fail 也算用掉、
+//       // 没有时间窗口恢复；下一轮对话（新 turn）自动重新给两格。
       const materialPaths = Array.isArray(args?.paths) ? args.paths.map(String) : [];
       const phaseRaw = args?.phase;
+      // ❗轮次号：额度按「一轮对话」刷新，不是按整个会话（见 turnOf 的注释）。
+      const reworkTurn = turnOf(exec);
       const rework = claimRework(cfg.stateDir, {
         chain: sessionChainOf(exec),
+        turn: reworkTurn,
         phase: phaseRaw,
         question,
         paths: materialPaths,
@@ -954,10 +967,12 @@ export function apply(ctx, pluginConfig = {}) {
             used: Array.isArray(rework.used) ? rework.used : [],
             phases: PHASES,
             rootSession: String(rework.rootSession || ''),
-            note: '一轮对话只有两个会审节点：design（动手之前）与 delivery（交付之前），各一次。'
+            ...(Number.isInteger(rework.turn) ? { turn: rework.turn } : {}),
+            note: '本轮（第 ' + (Number.isInteger(rework.turn) ? rework.turn : '?') + ' 轮）的两个会审节点：design（动手之前）与 delivery（交付之前），各一次。'
               + '判定是 fail 还是 pass 都算用掉 —— 拿 fail 就改写措辞重问，不会恢复额度（这正是要拦的动作）。'
-              + '被拦下时的正路：按已拿到的意见把活干完、把「未获通过」如实说明，由人决定是否交付。'
-              + '需要追加一次是政策例外，人工编辑 <stateDir>/consult-rework.json，agent 没有这个入口。',
+              + '被拦下时的正路：按已拿到的意见把活干完、把「未获通过」如实说明，由人决定是否交付；'
+              + '或者等下一轮对话（用户再发一句话）自动重新给两格。'
+              + '需要在本轮内追加一次是政策例外，人工编辑 <stateDir>/consult-rework.json，agent 没有这个入口。',
           },
         };
       }
@@ -984,7 +999,7 @@ export function apply(ctx, pluginConfig = {}) {
           ...par,
           mode,
           budget: { key: budgetKey, round: budget.round, used: budget.used + 1, maxRounds: budget.maxRounds, remaining: budget.remaining },
-          rework: { phase: String(rework.phase || ''), used: rework.used, phases: PHASES, rootSession: String(rework.rootSession || '') },
+          rework: { phase: String(rework.phase || ''), used: rework.used, phases: PHASES, rootSession: String(rework.rootSession || ''), ...(Number.isInteger(reworkTurn) ? { turn: reworkTurn } : {}) },
           ...(materialRejected.length ? { materialRejected } : {}),
           ...(materialStats ? { materialStats } : {}),
         };
@@ -1044,7 +1059,7 @@ export function apply(ctx, pluginConfig = {}) {
           mode,
           ms: Math.max(0, ...dual.map(d => d.ms)),
           budget: { key: budgetKey, round: budget.round, used: budget.used + 1, maxRounds: budget.maxRounds, remaining: budget.remaining },
-          rework: { phase: String(rework.phase || ''), used: rework.used, phases: PHASES, rootSession: String(rework.rootSession || '') },
+          rework: { phase: String(rework.phase || ''), used: rework.used, phases: PHASES, rootSession: String(rework.rootSession || ''), ...(Number.isInteger(reworkTurn) ? { turn: reworkTurn } : {}) },
           note: (bothOk ? 'dual 模式：两份回答都在 dual 里，逐条对照后再下判断；'
               : 'dual 模式但有上游失败（看各条的 reason/hint）；failed 的那条不能当成「没意见」；')
             + 'dual 下已忽略 provider 入参，也不签发 reviewId（两份独立意见不等于覆盖了某段改动）',
@@ -1103,7 +1118,7 @@ export function apply(ctx, pluginConfig = {}) {
         mode,
         ms: res.ms,
         budget: { key: budgetKey, round: budget.round, used: budget.used + 1, maxRounds: budget.maxRounds, remaining: budget.remaining },
-        rework: { phase: String(rework.phase || ''), used: rework.used, phases: PHASES, rootSession: String(rework.rootSession || '') },
+        rework: { phase: String(rework.phase || ''), used: rework.used, phases: PHASES, rootSession: String(rework.rootSession || ''), ...(Number.isInteger(reworkTurn) ? { turn: reworkTurn } : {}) },
         ...(res.provider === undefined ? {} : { provider: res.provider }),
         ...(answer.conclusion === undefined ? {} : { conclusion: answer.conclusion }),
         ...(answer.evidence === undefined ? {} : { evidence: answer.evidence }),
@@ -1438,6 +1453,48 @@ export function apply(ctx, pluginConfig = {}) {
       }
     } catch {}
     return out;
+  }
+
+  /**
+   * 「这一轮对话」的轮次号 —— 会审额度按它刷新（用户 2026-11-19：「一轮对话两个额度啊，
+   * 不是本会话两个额度」）。
+   *
+   * 依据（不是猜的）：内核 `@deepseek-ai/dsh-session` 的 `SessionEventMap` 里 `turn` 是一等公民
+   *   （`src/types.ts`：`'turn/start': { turn: number }`、`'turn/end'`、`'step/start'` 都带 turn），
+   *   而 `@deepseek-ai/dsh-agent` 的 `AgentRegistry.turnBoundaryOf(session)`（`src/index.ts:300`）
+   *   直接返回投影好的 `{ openTurnStartSeq, lastStepStartSeq, lastStepBoundary, lastTurn }`，
+   *   其中 `lastTurn` 就是最近一次 `turn/start` 的编号（`src/projection.ts:33-38`）。
+   *   服务名是 `ctx.agents`（`super(ctx, 'agents')`，`src/index.ts:260`）。
+   *
+   * 为什么要上溯到根会话再取 turn：子代理是另一个 Session、有自己的 turn 计数（往往还是 1），
+   *   直接取它自己的 turn 就等于「子代理每次都有一份新额度」——正是 fixed-phase 闸要堵的洞。
+   *   所以先走 sessionChainOf 找到根，再问根那一轮是第几轮。
+   *
+   * 兜底：任何一环失败都返回 null，identityOf 会把它当成 turn 0 ——
+   *   退化成「整个会话共用一个键」，宁可少给额度也不能每次调用都白送两格。
+   */
+  function turnOf(exec) {
+    try {
+      const chain = sessionChainOf(exec);
+      const rootId = chain.length ? chain[chain.length - 1] : '';
+      if (!rootId) return null;
+      let rootSession = null;
+      try {
+        rootSession = ctx && ctx.sessions && typeof ctx.sessions.get === 'function' ? ctx.sessions.get(rootId) : null;
+      } catch { rootSession = null; }
+      // 根就是当前会话时直接用它，省一次 sessions.get。
+      if (!rootSession && exec && exec.agent && exec.agent.session && String(sessionOf(exec)) === rootId) {
+        rootSession = exec.agent.session;
+      }
+      if (!rootSession) return null;
+      const agents = ctx && ctx.agents;
+      if (!agents || typeof agents.turnBoundaryOf !== 'function') return null;
+      const boundary = agents.turnBoundaryOf(rootSession);
+      const turn = boundary && boundary.lastTurn;
+      return Number.isInteger(turn) && turn >= 0 ? turn : null;
+    } catch {
+      return null;
+    }
   }
 
   // 复刻 @deepseek-ai/dsh-llm 的 createUserMessage 形状（不能 import：profile 的 node_modules 里没有这个包）。
