@@ -1,5 +1,93 @@
 # 变更记录
 
+## 0.9.5 — 2026-11-25
+
+### `turn` 那一端从来没通过：整个会话共用 `#t0`，额度锁死
+
+0.9.4 把身份从「会话」改成了「会话 + turn」，键的形状写对了 —— 账本里却始终只有一个 `#t0`。用户原话（2026-11-25）：
+
+> 「为什么会在 14:09 用掉，我们不是一轮对话两个额度吗？……这个问题真的修理好几次了还没好」
+
+#### 根因：`inject` 只有 `['tools']`
+
+`index.js:34` 声明的是 `export const inject = ['tools'];`，但插件实际用了三个服务：`ctx.tools`（注册工具）、`ctx.sessions`（取 Session）、`ctx.agents`（取 turn）。
+
+Cordis 的服务表**只按 `inject` 过滤写入**：`_store` 的两个写入点（fiber 启动时遍历 `Object.keys(this.inject)`、服务通知时 `if (!(name in fiber.inject)) continue`）都先看 inject，`committed` 再从 `_store` 复制。不在 inject 里的服务，`ctx.sessions` 这个读取会直接抛 `cannot get property "sessions" without inject`（Proxy get，`enhanceError` 包装）。
+
+而 `turnOf` 与 `sessionChainOf` 都把读取包在 `try/catch` 里 → 异常被吞成 `null` → `identityOf` 把 null 兜成 `turn 0` → 键固定 `#t0`。**失败没有任何出口**，这就是「改了两次都没生效」的原因：形状早就对了，取值那一端从未拿到过值。
+
+#### 为什么不补 `inject`（会审的反例救了我）
+
+最直觉的修法是补成 `['tools', 'sessions', 'agents']` —— 内核 20 多个插件都这么写。但设计会审（portdan，实测 83267 ms）给了一条关键反例：
+
+> 「若 agents/sessions 在插件启动时尚未提供，新增依赖可能推迟插件激活，进而推迟 apply() 里的工具注册；若服务永不提供或形成依赖环，**工具可能一直不可用**。」
+
+去 cordis 里核对，这条成立：`_refresh()` 遍历 `Object.keys(this.inject)`，任一服务没就绪即 `epoch = INACTIVE`；`_setEpoch()` 在 `oldEpoch === INACTIVE` 时走的是 `_unload()`，**根本不会调 `apply()`**。7 个工具全在 `apply()` 里注册 —— 一旦服务晚到或永不出现，整个插件静默消失。
+
+#### 修法：`ctx.reflect.get` 旁路
+
+`@deepseek-ai/cordis` 的 `_getImpl(name, strict)` 是绕开 inject 的公开读法（源码注释原文：`Read a service from the store without the inject requirement.`）。`reflect.get(name, true)` 在服务未提供时返回 `undefined`，**不抛错**。
+
+```js
+function serviceOf(ctx, name) {
+  try {
+    const reflect = ctx && ctx.reflect;
+    if (!reflect || typeof reflect.get !== 'function') return null;
+    const value = reflect.get(name, true);
+    return value === undefined ? null : value;
+  } catch { return null; }
+}
+```
+
+`sessionChainOf` 与 `turnOf` 里的 `ctx.sessions` / `ctx.agents` 全部换成这个旁路，`inject` 保持 `['tools']` 不动 —— 激活时序不受影响，工具仍在原时机注册。
+
+#### 失败有了出口
+
+`turnOf` 每一环失败都走 `turnFail(reason)`，落到 `~/.dsh/tandem-state/turn-probe.log`：
+
+- `chain-empty` / `sessions-service-missing` / `sessions-get-threw` / `sessions-get-null` / `agents-service-missing` / `turnBoundary-threw` / `lastTurn-not-integer` / `unexpected`
+- 限幅三条（回应会审「日志无上限会无限增长」那条反例）：超过 512 KB 截半重写；同一去重键 5 分钟内只记一行；任何 IO 失败吞掉。
+
+`apply()` 启动时另写一行自证，让下次重启能在 `load.log` 里直接看出修好没有：
+
+```
+boot services: sessions=ok, agents=ok
+```
+
+#### 交付会审又抓出两个洞
+
+第二轮会审（portdan, 149828 ms）结论是不能直接通过，两条反例都成立：
+
+> 「同一 reason 五分钟内全局只记一次，若首次异常后故障发生在另一个会话或阶段，turn-probe.log 不会留下新记录；启动自证只说明 apply 时服务可见，不能证明后续读取或 turn 计算成功。」
+
+> 「未提供完整 turnOf 实现；如果 agents 的读取抛错或返回异常结构后统一落入 unexpected，探针可能无法指出具体失败环节。」
+
+对应改动：
+
+1. **去重键加 scope（会话 id）** —— 同一 reason 换一个会话必须留下新记录，不再被全局吞掉。
+2. **被抑制次数回写** —— 窗口结束时先写一行 `(suppressed 40x in the previous window)`，让「连续失败 40 次」和「只失败 1 次」在日志里分得开。
+3. **成功也留痕** —— `turnOk(turn, scope)` 写 `TURN-OK turn=16`。启动自证只证明 apply 那一刻服务可见，这条才证明后续真的算出了 turn。
+4. **`turnBoundaryOf` 单独包一层** —— 它抛错时落 `turnBoundary-threw`，不再和别的代码 bug 一起挤进笼统的 `unexpected`。
+5. **探针提到模块作用域**（`export function makeTurnProbe(...)`）—— 塞在 `apply()` 闭包里的话，测试只能测复制品。**这个改动是被测试逼出来的**：第一版 `turn-probe-behaviour.mjs` 想验「抑制次数回写」，发现闭包里的实现根本测不到，只好把真身导出。同时给探针注入时钟 `now`，否则「窗口为 0」的写法永远走不到抑制分支（第一版测试就栽在这，报 `suppressed 1x`）。
+
+#### 测试
+
+新增三个回归测试，锁住「别再改回去」：
+
+- `test/turn-probe.mjs` —— `inject` 必须仍为 `["tools"]`（防后人「顺手补全」）；mock 出 cordis 真实行为（直接读抛错、`reflect.get` 可取）验证旁路；探针必须落在隔离目录。
+- `test/boot-probe.mjs` —— 启动自证行必须写入；服务真缺失时必须报 `MISSING`，不许吞异常后显示 `ok`。
+- `test/turn-probe-behaviour.mjs` —— 三条交付会审反例的针对性验证：跨会话不被去重吞、抑制次数回写、成功留痕、8 种失败原因可区分、超限截半。
+
+**测试污染生产日志的坑**：`index.js` 在 import 期就执行 `probe('module evaluated')`，测试一 import 就往真实 `load.log` 写行（实测污染 11 行）。修法是 `const PROBE_DIR = process.env.DSH_TANDEM_PROBE_DIR || join(homedir(), '.dsh', 'tandem-state')`，两个日志文件都基于它，测试先设 env 再动态 import。全量跑 43 个测试，`prod_log_delta=0`。
+
+套件 43 个测试全绿。
+
+#### 账本迁移
+
+修好后新 turn 自然落到新键（`#t17` 之类），**不需要动账本文件**。已有的 `#t0` 键留着无害。验证方式：重启后看 `consult-rework.json` 新键的 `turn` 字段是不是非 0 整数，而不是又一条 `#t0`。
+
+---
+
 ## 0.9.4 — 2026-11-19
 
 ### 「一轮对话两个额度」被我做成了「整个会话两个额度」

@@ -12,7 +12,7 @@
  *  - 不在这里做 PreToolUse 阻断。参数校验已经天然强制，hook 只该拦不可逆操作，
  *    否则 agent 被拦后会改写命令重试，形成死循环。
  */
-import { existsSync, readFileSync, appendFileSync, mkdirSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, appendFileSync, mkdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { validateTasks, normalizeRoots, runTasks, summarize, runOne, insideRoots } from './lib/delegate.js';
@@ -31,7 +31,36 @@ import { ensureEnv, credentialsPath } from './lib/env.js';
 import { resolveCodexCommand } from './lib/codex-path.js';
 
 export const name = 'dsh-tandem';
+// ❗只声明 tools，不把 sessions / agents 写进来（2026-11-25 修 bug 时的刻意选择）。
+//
+// 背景：turnOf 需要 `ctx.sessions.get()` 与 `ctx.agents.turnBoundaryOf()`，但历史上这里
+// 只写了 ['tools']，于是 cordis 的 inject 闸把这两个服务挡在外面，`ctx.sessions` 抛
+// `cannot get property "sessions" without inject`，被 turnOf 的 try/catch 吞成 null，
+// 再被 identityOf 兜底成 turn 0 —— 整个会话共用一个 `#t0` 额度，一轮两个额度的设计形同虚设。
+//
+// 为什么**不**直接把两个服务补进 inject（这才是内核 20 多个插件的通行写法）：
+//   cordis 的 `_refresh()` 遍历 inject，任一服务未就绪就把 epoch 设成 INACTIVE，
+//   `_setEpoch` 走 `_unload()` 而**不**调 `apply()`；本插件 7 个工具全部在 apply() 里注册。
+//   ⇒ 万一 sessions / agents 在本插件之后才提供、或永不提供，工具会整体消失。
+//   这是双向死路：修 turn 反而可能让整个插件失效。
+//
+// 所以改用 cordis 官方留的旁路 `ctx.reflect.get(name, true)`（`cordis/lib/index.js:1339`
+// 注释原文 "Read a service from the store without the inject requirement."）：
+// 激活时序、工具注册时机全部保持不变，只在真正要用到那两个服务时才去取，取不到就记日志。
 export const inject = ['tools'];
+
+/** 读一个服务，绕开 cordis 的 inject 闸；取不到返回 null 而不是抛错。
+ *  strict=true 时只接受「提供它的 fiber 当前处于激活态」的实现（cordis 的默认语义）。 */
+function serviceOf(ctx, name) {
+  try {
+    const reflect = ctx && ctx.reflect;
+    if (!reflect || typeof reflect.get !== 'function') return null;
+    const value = reflect.get(name, true);
+    return value === undefined ? null : value;
+  } catch {
+    return null;
+  }
+}
 
 // 不 import @deepseek-ai/dsh-tools（profile 的 node_modules 里没有这个包，解析必失败）。
 // 但它的 defineTool 做了两件必须的事：把作者写法里的「属性级 required: true」编译成
@@ -90,14 +119,68 @@ const defineTool = options => ({
 // 加载探针：DSH 不写运行日志，插件加载失败时界面上什么也看不到。
 // 这里把「模块已求值 / apply 开始 / 每个工具注册结果」写进固定文件，
 // 是唯一能在重启后判断"到底哪一步断了"的依据。失败绝不抛出。
-const PROBE_FILE = join(homedir(), '.dsh', 'tandem-state', 'load.log');
+//
+// ❗目录可用 DSH_TANDEM_PROBE_DIR 覆盖（2026-11-25 加）：`probe('module evaluated')`
+//   在 import 期就写，测试只要 import 本模块就会往生产日志里塞行。留这个开关，
+//   测试才能放进临时目录，不污染真实的 load.log / turn-probe.log。
+const PROBE_DIR = process.env.DSH_TANDEM_PROBE_DIR || join(homedir(), '.dsh', 'tandem-state');
+const PROBE_FILE = join(PROBE_DIR, 'load.log');
 function probe(msg) {
   try {
-    mkdirSync(join(homedir(), '.dsh', 'tandem-state'), { recursive: true });
+    mkdirSync(PROBE_DIR, { recursive: true });
     appendFileSync(PROBE_FILE, new Date().toISOString() + ' ' + msg + '\n');
   } catch {}
 }
 probe('module evaluated');
+
+// turn 探针（2026-11-25 事故驱动）。放在模块作用域而不是 apply() 里，是为了能被测试直接调 ——
+// 塞在闭包里的话，测试只能测一份复制品，「去重会不会吞掉另一个会话的故障」这类问题就永远测不到
+// （交付会审第 1 条反例正是这个）。
+//
+// 限幅三条：
+//   1) 超过 maxBytes 先截半再写，永不无限增长；
+//   2) 同一 key 在 dedupMs 内只记一行，但**被抑制的次数会写进下一行**——
+//      否则「连续失败 40 次」和「只失败 1 次」在日志里长得一样；
+//   3) 任何 IO 失败都吞掉 —— 记日志绝不能把工具调用搞崩。
+//
+// ❗去重键包含 scope（会话 id）：同一 reason 发生在另一个会话必须留下新记录，
+//   否则「全局只记一次」会把新会话的故障静默吞掉（交付会审反例原文即此）。
+export function makeTurnProbe({ dir, maxBytes = 512 * 1024, dedupMs = 5 * 60 * 1000, now = () => Date.now() } = {}) {
+  const file = join(dir, 'turn-probe.log');
+  let seen = new Map();
+  function write(line) {
+    try {
+      mkdirSync(dir, { recursive: true });
+      try {
+        const st = statSync(file);
+        if (st.size > maxBytes) {
+          const keep = readFileSync(file).subarray(-Math.floor(maxBytes / 2));
+          writeFileSync(file, keep);
+        }
+      } catch {}
+      appendFileSync(file, new Date().toISOString() + ' ' + line + '\n');
+    } catch {}
+  }
+  function note(kind, scope, detail) {
+    const clean = String(detail || '').slice(0, 200);
+    const key = kind + '|' + scope + '|' + clean.slice(0, 120);
+    const at = now();
+    const prev = seen.get(key);
+    if (prev && at - prev.at < dedupMs) { prev.n += 1; return; }
+    if (prev) write(kind + ' (suppressed ' + prev.n + 'x in the previous window) ' + scope + ' ' + clean);
+    seen.set(key, { at, n: 1 });
+    if (seen.size > 64) seen = new Map();
+    write(kind + ' ' + scope + ' ' + clean);
+  }
+  return {
+    file,
+    fail(reason, scope) { note('TURN-FAIL', scope || '(no-scope)', reason); return null; },
+    ok(turn, scope) { note('TURN-OK', scope || '(no-scope)', 'turn=' + turn); return turn; },
+    note,
+    /** 测试专用：清空去重表，让下一次调用立刻落盘。 */
+    reset() { seen = new Map(); },
+  };
+}
 
 const DEFAULTS = {
   codexCommand: 'codex',
@@ -211,6 +294,11 @@ export function apply(ctx, pluginConfig = {}) {
   // 而不是等谁先调一次 tandem_status —— 否则先派活的人会撞上「Codex 缺 API key」。
   const bootEnv = ensureEnv(cfg.envKey);
   probe('apply start, codex=' + cfg.codexCommand + ', env=' + bootEnv.source + ', tools service=' + (typeof ctx?.tools));
+  // 启动自证（2026-11-25 事故后加）：inject 只有 tools，sessions/agents 只能走 reflect 旁路取。
+  // 这两行必须能在 load.log 里直接读出「取到了 / 没取到」——否则下次再坏还是靠猜。
+  // 注意判据是服务对象本身，不是 typeof：cordis 的 reflect 旁路取不到时返回 undefined（不抛错）。
+  probe('boot services: sessions=' + (serviceOf(ctx, 'sessions') ? 'ok' : 'MISSING')
+    + ', agents=' + (serviceOf(ctx, 'agents') ? 'ok' : 'MISSING'));
 
   // 改动账本：任何走 fs 服务的写入都进这里（含 run_code 里的嵌套调用）。
   // 目的只有一个 —— 让「这轮改了哪些文件、有没有会审覆盖」变成插件能查到的事实，而不是靠模型自述。
@@ -1446,7 +1534,8 @@ export function apply(ctx, pluginConfig = {}) {
         if (!parent) break;
         push(parent);
         let next = null;
-        try { next = ctx && ctx.sessions && typeof ctx.sessions.get === 'function' ? ctx.sessions.get(String(parent)) : null; } catch { next = null; }
+        const sessions = serviceOf(ctx, 'sessions');
+        try { next = sessions && typeof sessions.get === 'function' ? sessions.get(String(parent)) : null; } catch { next = null; }
         // 取不到父 Session 就停：链末位已经是已知最高一代，identityOf 会把它当根。
         if (!next) break;
         cur = next;
@@ -1472,29 +1561,61 @@ export function apply(ctx, pluginConfig = {}) {
    *
    * 兜底：任何一环失败都返回 null，identityOf 会把它当成 turn 0 ——
    *   退化成「整个会话共用一个键」，宁可少给额度也不能每次调用都白送两格。
+   *
+   * ❗但兜底必须留下痕迹（2026-11-25 加，事故驱动）：这个函数静默返回 null 藏了整整 8 天。
+   *   形状（#t<turn>）2026-11-17 就改对了，取值端一直取不到，账本里从头到尾只有 `#t0`，
+   *   于是「一轮两个额度」退化成「整会话一份额度」，同一轮里第二次会审永远被拒。
+   *   现象不难查，难在**没有任何出口能看出这是兜底**——每次修都在猜。
+   *   ⇒ 现在每一环失败都写进 turn-probe.log（失败记原因、成功也记一条 TURN-OK；
+   *     有大小上限、同原因同会话 5 分钟内合并并回写被抑制次数）。
    */
   function turnOf(exec) {
+    // scope 取当前会话 id：去重键必须带它，否则另一个会话的同类故障会被静默吞掉。
+    const scope = sessionOf(exec) || '(no-session)';
     try {
       const chain = sessionChainOf(exec);
       const rootId = chain.length ? chain[chain.length - 1] : '';
-      if (!rootId) return null;
+      if (!rootId) return turnFail('chain-empty', scope);
       let rootSession = null;
+      const sessions = serviceOf(ctx, 'sessions');
+      if (!sessions || typeof sessions.get !== 'function') return turnFail('sessions-service-missing', scope);
       try {
-        rootSession = ctx && ctx.sessions && typeof ctx.sessions.get === 'function' ? ctx.sessions.get(rootId) : null;
-      } catch { rootSession = null; }
+        rootSession = sessions.get(rootId);
+      } catch (error) {
+        return turnFail('sessions-get-threw: ' + (error && error.message || error), scope);
+      }
       // 根就是当前会话时直接用它，省一次 sessions.get。
       if (!rootSession && exec && exec.agent && exec.agent.session && String(sessionOf(exec)) === rootId) {
         rootSession = exec.agent.session;
       }
-      if (!rootSession) return null;
-      const agents = ctx && ctx.agents;
-      if (!agents || typeof agents.turnBoundaryOf !== 'function') return null;
-      const boundary = agents.turnBoundaryOf(rootSession);
+      if (!rootSession) return turnFail('sessions-get-null: ' + rootId, scope);
+      const agents = serviceOf(ctx, 'agents');
+      if (!agents || typeof agents.turnBoundaryOf !== 'function') return turnFail('agents-service-missing', scope);
+      // ❗turnBoundaryOf 自己的调用单独包一层：它抛错时不能再落进笼统的 unexpected，
+      //   否则「服务在、但读取炸了」和「代码里有别的 bug」在日志里分不开（交付会审第 3 条反例）。
+      let boundary;
+      try {
+        boundary = agents.turnBoundaryOf(rootSession);
+      } catch (error) {
+        return turnFail('turnBoundary-threw: ' + (error && error.message || error), scope);
+      }
       const turn = boundary && boundary.lastTurn;
-      return Number.isInteger(turn) && turn >= 0 ? turn : null;
-    } catch {
-      return null;
+      if (!Number.isInteger(turn) || turn < 0) {
+        return turnFail('lastTurn-not-integer: ' + (boundary && JSON.stringify(boundary) || String(boundary)), scope);
+      }
+      return turnOk(turn, scope);
+    } catch (error) {
+      return turnFail('unexpected: ' + (error && (error.stack || error.message) || error), scope);
     }
+  }
+
+  /** turn 探针：模块级实现（见 makeTurnProbe），这里只是绑到本插件的探针目录。 */
+  const turnProbe = makeTurnProbe({ dir: PROBE_DIR });
+  function turnFail(reason, scope) {
+    return turnProbe.fail(reason, scope);
+  }
+  function turnOk(turn, scope) {
+    return turnProbe.ok(turn, scope);
   }
 
   // 复刻 @deepseek-ai/dsh-llm 的 createUserMessage 形状（不能 import：profile 的 node_modules 里没有这个包）。
